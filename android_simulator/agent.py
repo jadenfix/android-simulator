@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from .computer_use import DeviceController, Observation, StaleStateError, action
 from .errors import AndroidSimError
 from .perception import compact_for_task
 from .program import ground_program_action, guard_matches, program_contract
+from .skills import SkillStore
 
 
 SENSITIVE_LABELS = {
@@ -41,6 +43,8 @@ class AgentConfig:
     settle_timeout_ms: int = 900
     require_completion_evidence: bool = True
     max_completion_rejects: int = 4
+    use_skill_cache: bool = False
+    skill_cache_path: str = field(default_factory=lambda: os.environ.get("ANDROID_AGENT_SKILL_CACHE", ""))
 
 
 @dataclass
@@ -212,6 +216,9 @@ class ComputerUseAgent:
         self.controller = controller
         self.planner = planner
         self.config = config
+        self.skill_store = SkillStore(Path(config.skill_cache_path)) if config.use_skill_cache and config.skill_cache_path else (
+            SkillStore() if config.use_skill_cache else None
+        )
 
     def _plan(self, task: str, observation: Observation, history: list[dict[str, Any]]) -> dict[str, Any]:
         force_full = bool(history and history[-1].get("event") == "completion_rejected")
@@ -254,33 +261,39 @@ class ComputerUseAgent:
         observation: Observation,
         history: list[dict[str, Any]],
         outer_step: int,
-    ) -> tuple[Observation, int]:
+        *,
+        source: str = "program",
+    ) -> tuple[Observation, int, bool]:
         current = observation
         total_actions = 0
+        completed = bool(program) and len(program) <= self.config.max_program_steps
         for index, raw_step in enumerate(program[: self.config.max_program_steps]):
             if not isinstance(raw_step, dict):
-                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "step_not_object"})
+                history.append({"step": outer_step, "event": f"{source}_abort", "program_index": index, "reason": "step_not_object"})
+                completed = False
                 break
             if not guard_matches(current, raw_step.get("when")):
                 history.append({
                     "step": outer_step,
-                    "event": "program_abort",
+                    "event": f"{source}_abort",
                     "program_index": index,
                     "reason": "guard_mismatch",
                     "state": current.state_hash,
                     "revision": current.revision,
                 })
+                completed = False
                 break
             action, reason = ground_program_action(raw_step.get("action"), current)
             if action is None:
                 history.append({
                     "step": outer_step,
-                    "event": "program_abort",
+                    "event": f"{source}_abort",
                     "program_index": index,
                     "reason": reason,
                     "state": current.state_hash,
                     "revision": current.revision,
                 })
+                completed = False
                 break
 
             self._require_sensitive_approval(action, current)
@@ -295,24 +308,26 @@ class ComputerUseAgent:
                 current = exc.observation
                 history.append({
                     "step": outer_step,
-                    "event": "program_abort",
+                    "event": f"{source}_abort",
                     "program_index": index,
                     "reason": "stale_state",
                     "state": before.state_hash,
                     "next_state": current.state_hash,
                     "revision": current.revision,
                 })
+                completed = False
                 break
 
             transition = self._transition()
             total_actions += len(results)
             if not results:
-                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "missing_receipt"})
+                history.append({"step": outer_step, "event": f"{source}_abort", "program_index": index, "reason": "missing_receipt"})
+                completed = False
                 break
             result = results[0]
             history.append({
                 "step": outer_step,
-                "event": "program_action",
+                "event": f"{source}_action",
                 "program_index": index,
                 "state": before.state_hash,
                 "revision": before.revision,
@@ -325,20 +340,79 @@ class ComputerUseAgent:
                 "transition": transition,
             })
             if not result.ok:
-                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "action_failed"})
+                history.append({"step": outer_step, "event": f"{source}_abort", "program_index": index, "reason": "action_failed"})
+                completed = False
                 break
             if action.get("type") != "wait" and transition.get("changed") is False:
-                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "no_state_change"})
+                history.append({"step": outer_step, "event": f"{source}_abort", "program_index": index, "reason": "no_state_change"})
+                completed = False
                 break
 
         if len(program) > self.config.max_program_steps:
             history.append({
                 "step": outer_step,
-                "event": "program_truncated",
+                "event": f"{source}_truncated",
                 "planned_steps": len(program),
                 "limit": self.config.max_program_steps,
             })
-        return current, total_actions
+            completed = False
+        return current, total_actions, completed
+
+    def _try_cached_skill(
+        self,
+        task: str,
+        observation: Observation,
+        history: list[dict[str, Any]],
+    ) -> tuple[Observation, int, bool, str]:
+        if self.skill_store is None:
+            return observation, 0, False, ""
+        candidates = self.skill_store.candidates(task, observation)
+        if not candidates:
+            return observation, 0, False, ""
+        skill = candidates[0]
+        start = observation
+        history.append({
+            "step": 0,
+            "event": "skill_attempt",
+            "skill_id": skill.id,
+            "state": start.state_hash,
+            "revision": start.revision,
+        })
+        current, actions, completed = self._execute_program(
+            skill.program,
+            start,
+            history,
+            0,
+            source="skill",
+        )
+        if completed:
+            valid, checks, reason = validate_completion_evidence(skill.completion_evidence, current)
+            if valid:
+                self.skill_store.learn(
+                    task=task,
+                    start_observation=start,
+                    program=skill.program,
+                    final_observation=current,
+                    completion_evidence=skill.completion_evidence,
+                )
+                history.append({
+                    "step": 0,
+                    "event": "skill_hit",
+                    "skill_id": skill.id,
+                    "state": current.state_hash,
+                    "revision": current.revision,
+                    "checks": checks,
+                })
+                return current, actions, True, f"completed via verified cached skill {skill.id}"
+            history.append({
+                "step": 0,
+                "event": "skill_rejected",
+                "skill_id": skill.id,
+                "reason": reason,
+                "checks": checks,
+            })
+        self.skill_store.record_failure(skill.id)
+        return current, actions, False, ""
 
     def run(self, task: str) -> AgentRun:
         history: list[dict[str, Any]] = []
@@ -347,7 +421,13 @@ class ComputerUseAgent:
         repeated_states = 0
         stale_replans = 0
         completion_rejects = 0
+        pending_skill: tuple[Observation, list[dict[str, Any]]] | None = None
         observation = self.controller.observe()
+
+        observation, skill_actions, skill_done, skill_summary = self._try_cached_skill(task, observation, history)
+        total_actions += skill_actions
+        if skill_done:
+            return AgentRun(task, True, skill_summary, 0, total_actions, history)
 
         for step in range(1, self.config.max_steps + 1):
             if observation.state_hash == last_hash:
@@ -394,6 +474,21 @@ class ComputerUseAgent:
                         "revision": observation.revision,
                         "checks": checks,
                     })
+                if pending_skill is not None and self.skill_store is not None:
+                    skill_start, skill_program = pending_skill
+                    learned = self.skill_store.learn(
+                        task=task,
+                        start_observation=skill_start,
+                        program=skill_program,
+                        final_observation=observation,
+                        completion_evidence=plan.get("evidence"),
+                    )
+                    if learned is not None:
+                        history.append({
+                            "step": step,
+                            "event": "skill_learned",
+                            "skill_id": learned.id,
+                        })
                 return AgentRun(task, True, str(plan.get("summary", "done")), step, total_actions, history)
 
             if not isinstance(actions_value, list) or not isinstance(program_value, list):
@@ -402,12 +497,15 @@ class ComputerUseAgent:
                 raise AndroidSimError("Planner must return either actions or a guarded program, not both")
 
             if program_value:
-                observation, executed = self._execute_program(program_value, observation, history, step)
+                program_start = observation
+                observation, executed, completed = self._execute_program(program_value, observation, history, step)
                 total_actions += executed
+                pending_skill = (program_start, copy.deepcopy(program_value)) if completed else None
                 if repeated_states >= 4:
                     raise AndroidSimError("Agent is stuck: UI state repeated without progress")
                 continue
 
+            pending_skill = None
             if not actions_value:
                 raise AndroidSimError(f"Planner returned no executable actions at step {step}: {plan}")
             if not all(isinstance(action, dict) for action in actions_value):
