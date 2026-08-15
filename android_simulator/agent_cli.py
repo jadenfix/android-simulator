@@ -7,6 +7,7 @@ import sys
 
 from . import adb as adb_module
 from .agent import AgentConfig, ComputerUseAgent, PlannerClient
+from .benchmark import run_benchmark
 from .computer_use import DeviceController, action_schema
 from .config import discover_toolchain
 from .errors import AndroidSimError
@@ -34,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--approve-sensitive", action="store_true")
     run.add_argument("--json", action="store_true")
 
+    bench = sub.add_parser("bench", help="Measure structured observation and ADB batching latency")
+    bench.add_argument("--iterations", type=int, default=20)
+    bench.add_argument("--batch-size", type=int, default=8)
+
     sub.add_parser("tools", help="Print the computer-use action contract")
     sub.add_parser("mcp", help="Serve Android tools over MCP stdio")
     return parser
@@ -54,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
             action = json.loads(args.action)
             result = controller.act(action, controller.observe())
             print(json.dumps(result.__dict__, indent=2))
+            return 0
+        if args.command == "bench":
+            print(json.dumps(run_benchmark(controller, iterations=args.iterations, batch_size=args.batch_size), indent=2))
             return 0
         if args.command == "tools":
             print(json.dumps(action_schema(), indent=2))
