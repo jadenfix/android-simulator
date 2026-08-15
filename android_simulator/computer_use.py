@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -89,14 +90,8 @@ class Observation:
     captured_at: float
     latency_ms: float
 
-    @property
-    def state_hash(self) -> str:
-        payload = json.dumps(self.compact(), sort_keys=True, separators=(",", ":"))
-        return hashlib.blake2s(payload.encode(), digest_size=12).hexdigest()
-
-    def compact(self, *, max_nodes: int = 180) -> dict[str, Any]:
-        # Keep actionable nodes plus labelled leaves. This is substantially smaller than raw XML.
-        ranked = sorted(
+    def _ranked(self, max_nodes: int) -> list[UINode]:
+        return sorted(
             self.nodes,
             key=lambda n: (
                 not (n.clickable or n.scrollable),
@@ -105,13 +100,29 @@ class Observation:
                 n.ref,
             ),
         )[:max_nodes]
+
+    def _hash_body(self) -> dict[str, Any]:
+        return {
+            "package": self.package,
+            "activity": self.activity,
+            "screen": [self.width, self.height],
+            "nodes": [node.compact() for node in self._ranked(180)],
+        }
+
+    @property
+    def state_hash(self) -> str:
+        payload = json.dumps(self._hash_body(), sort_keys=True, separators=(",", ":"))
+        return hashlib.blake2s(payload.encode(), digest_size=12).hexdigest()
+
+    def compact(self, *, max_nodes: int = 180) -> dict[str, Any]:
         return {
             "serial": self.serial,
             "package": self.package,
             "activity": self.activity,
             "screen": [self.width, self.height],
-            "state_hash": self.state_hash if max_nodes == 180 else None,
-            "nodes": [node.compact() for node in ranked],
+            "state_hash": self.state_hash,
+            "latency_ms": round(self.latency_ms, 1),
+            "nodes": [node.compact() for node in self._ranked(max_nodes)],
         }
 
 
@@ -140,12 +151,10 @@ class DeviceController:
 
     def _window(self) -> tuple[str, str]:
         raw = self._shell(["dumpsys", "window", "windows"], check=False)
-        # Handles common mCurrentFocus/mFocusedApp formats without depending on Android version.
-        match = re.search(r"(?:mCurrentFocus|mFocusedApp).*? ([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)", raw)
+        match = re.search(r"(?:mCurrentFocus|mFocusedApp).*? ([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", raw)
         if not match:
             return "", ""
-        component_match = re.search(r"(?:mCurrentFocus|mFocusedApp).*? ([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", raw)
-        component = component_match.group(1) if component_match else ""
+        component = match.group(1)
         package, _, activity = component.partition("/")
         return package, activity
 
@@ -156,11 +165,9 @@ class DeviceController:
 
     def _hierarchy_xml(self) -> str:
         remote = "/sdcard/.android-sim-window.xml"
-        # --compressed strips unimportant layout-only nodes and materially reduces planning tokens.
         self._shell(["uiautomator", "dump", "--compressed", remote], check=False)
         xml = self._shell(["cat", remote], check=False)
         if "<hierarchy" not in xml:
-            # Some builds reject --compressed; use the universally supported form.
             self._shell(["uiautomator", "dump", remote], check=False)
             xml = self._shell(["cat", remote], check=False)
         if "<hierarchy" not in xml:
@@ -182,23 +189,21 @@ class DeviceController:
             left, top, right, bottom = (int(v) for v in match.groups())
             if right <= left or bottom <= top:
                 continue
-            nodes.append(
-                UINode(
-                    ref=f"n{index}",
-                    text=attrs.get("text", "").strip(),
-                    content_desc=attrs.get("content-desc", "").strip(),
-                    resource_id=attrs.get("resource-id", "").strip(),
-                    class_name=attrs.get("class", "").strip(),
-                    package=attrs.get("package", "").strip(),
-                    bounds=Rect(left, top, right, bottom),
-                    clickable=attrs.get("clickable") == "true",
-                    enabled=attrs.get("enabled", "true") == "true",
-                    focusable=attrs.get("focusable") == "true",
-                    scrollable=attrs.get("scrollable") == "true",
-                    selected=attrs.get("selected") == "true",
-                    checked=attrs.get("checked") == "true",
-                )
-            )
+            nodes.append(UINode(
+                ref=f"n{index}",
+                text=attrs.get("text", "").strip(),
+                content_desc=attrs.get("content-desc", "").strip(),
+                resource_id=attrs.get("resource-id", "").strip(),
+                class_name=attrs.get("class", "").strip(),
+                package=attrs.get("package", "").strip(),
+                bounds=Rect(left, top, right, bottom),
+                clickable=attrs.get("clickable") == "true",
+                enabled=attrs.get("enabled", "true") == "true",
+                focusable=attrs.get("focusable") == "true",
+                scrollable=attrs.get("scrollable") == "true",
+                selected=attrs.get("selected") == "true",
+                checked=attrs.get("checked") == "true",
+            ))
         return tuple(nodes)
 
     def observe(self) -> Observation:
@@ -220,7 +225,10 @@ class DeviceController:
         return observation
 
     def screenshot(self, destination: Path | None = None) -> Path:
-        destination = destination or Path(tempfile.mkstemp(prefix="android-agent-", suffix=".png")[1])
+        if destination is None:
+            fd, name = tempfile.mkstemp(prefix="android-agent-", suffix=".png")
+            os.close(fd)
+            destination = Path(name)
         remote = "/sdcard/.android-sim-screen.png"
         self._shell(["screencap", "-p", remote])
         adb_module.adb(self.toolchain, self.serial, ["pull", remote, destination], quiet=True)
@@ -233,13 +241,11 @@ class DeviceController:
                 if node.ref == selector:
                     return node
         needle = selector.casefold()
-        candidates = [
-            node
-            for node in obs.nodes
-            if needle in node.text.casefold()
+        candidates = [node for node in obs.nodes if (
+            needle in node.text.casefold()
             or needle in node.content_desc.casefold()
             or needle in node.resource_id.casefold()
-        ]
+        )]
         if not candidates:
             raise AndroidSimError(f"No UI node matches {selector!r}")
         candidates.sort(key=lambda n: (not n.clickable, not n.enabled, n.bounds.area))
@@ -247,7 +253,6 @@ class DeviceController:
 
     @staticmethod
     def _input_text(value: str) -> str:
-        # Android input text treats %s as a space. Quote metacharacters for the shell command argv.
         return value.replace("%", "%25").replace(" ", "%s")
 
     def act(self, action: dict[str, Any], observation: Observation | None = None) -> ActionResult:
@@ -273,7 +278,7 @@ class DeviceController:
                 value = str(action.get("text", ""))
                 if action.get("clear"):
                     self._shell(["input", "keyevent", "KEYCODE_MOVE_END"], check=False)
-                    for _ in range(int(action.get("clear_chars", 120))):
+                    for _ in range(min(int(action.get("clear_chars", 120)), 300)):
                         self._shell(["input", "keyevent", "KEYCODE_DEL"], check=False)
                 self._shell(["input", "text", self._input_text(value)])
                 detail = f"{len(value)} chars"
@@ -286,18 +291,13 @@ class DeviceController:
             elif kind == "enter":
                 self._shell(["input", "keyevent", "KEYCODE_ENTER"])
             elif kind == "swipe":
-                self._shell([
-                    "input", "swipe",
-                    str(int(action["x1"])), str(int(action["y1"])),
-                    str(int(action["x2"])), str(int(action["y2"])),
-                    str(int(action.get("duration_ms", 220))),
-                ])
+                self._shell(["input", "swipe", str(int(action["x1"])), str(int(action["y1"])), str(int(action["x2"])), str(int(action["y2"])), str(int(action.get("duration_ms", 220)))])
             elif kind == "scroll":
                 width, height = (obs.width, obs.height) if obs else self._screen_size()
                 direction = str(action.get("direction", "down"))
-                amount = float(action.get("amount", 0.62))
+                amount = max(0.1, min(float(action.get("amount", 0.62)), 0.8))
                 x = width // 2
-                hi, lo = int(height * 0.78), int(height * max(0.18, 0.78 - amount))
+                hi, lo = int(height * 0.78), int(height * max(0.12, 0.78 - amount))
                 y1, y2 = (hi, lo) if direction == "down" else (lo, hi)
                 self._shell(["input", "swipe", str(x), str(y1), str(x), str(y2), "180"])
             elif kind == "launch":
@@ -319,8 +319,6 @@ class DeviceController:
             if index >= max_actions:
                 raise AndroidSimError(f"Macro exceeds {max_actions} action limit")
             results.append(self.act(action, obs))
-            # Node refs are only valid for the state they came from. Force re-observe after any UI-changing action
-            # if another selector-based action follows; coordinate/key macros can stay on the fast path.
             obs = None
         return results
 
