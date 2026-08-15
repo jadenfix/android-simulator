@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serial", default=os.environ.get("ANDROID_SIM_SERIAL"))
     parser.add_argument("--transport", choices=("auto", "bridge", "adb"), default=os.environ.get("ANDROID_AGENT_TRANSPORT", "auto"))
     parser.add_argument("--model", default=os.environ.get("ANDROID_AGENT_MODEL", ""))
+    parser.add_argument("--vision-model", default=os.environ.get("ANDROID_AGENT_VISION_MODEL", ""))
     parser.add_argument("--endpoint", default=os.environ.get("ANDROID_AGENT_ENDPOINT", "http://127.0.0.1:11434/v1/chat/completions"))
     parser.add_argument("--api-key", default=os.environ.get("ANDROID_AGENT_API_KEY", ""))
     sub = parser.add_subparsers(dest="command", required=True)
@@ -40,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task")
     run.add_argument("--max-steps", type=int, default=40)
     run.add_argument("--max-actions-per-step", type=int, default=8)
+    run.add_argument("--task-context-nodes", type=int, default=72)
+    run.add_argument("--full-context-nodes", type=int, default=360)
     run.add_argument("--settle-timeout-ms", type=int, default=900)
     run.add_argument("--no-vision", action="store_true")
     run.add_argument("--approve-sensitive", action="store_true")
@@ -113,9 +116,12 @@ def main(argv: list[str] | None = None) -> int:
             config = AgentConfig(
                 endpoint=args.endpoint,
                 model=args.model,
+                vision_model=args.vision_model,
                 api_key=args.api_key,
                 max_steps=args.max_steps,
                 max_actions_per_step=args.max_actions_per_step,
+                task_context_nodes=max(16, min(args.task_context_nodes, 240)),
+                full_context_nodes=max(64, min(args.full_context_nodes, 600)),
                 use_vision=not args.no_vision,
                 auto_approve_sensitive=args.approve_sensitive,
                 settle_timeout_ms=max(0, min(args.settle_timeout_ms, 5000)),
