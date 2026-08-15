@@ -1,0 +1,17 @@
+{
+  "schema_version": "android-simulator-tempera-dependencies/v1",
+  "dependencies": [
+    {
+      "repository": "tempera-dev/tempera-gym",
+      "commit": "a2ed2dc4ce8170c50cad9e7ab5dfb912b99bb14d",
+      "path": "contracts/trajectory-v1.schema.json",
+      "blob_sha": "9c3fea6a4017a1665eea6d0ed2b92176208c0f02",
+      "usage": "AndroidGymEnv trajectory_v1 producer contract"
+    },
+    {
+      "repository": "tempera-dev/tempera-mcp",
+      "commit": "ac28724d8c8e2a7ee6e3426a8d7c43e4f4a3263c",
+      "usage": "Production front door for the dependency-free Android MCP stdio provider; no runtime code is vendored"
+    }
+  ]
+}
