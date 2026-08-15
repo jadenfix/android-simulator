@@ -17,7 +17,6 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import org.json.JSONArray;
-import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -35,6 +34,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class BridgeAccessibilityService extends AccessibilityService {
     private final AtomicLong revision = new AtomicLong(1L);
+    private final AtomicLong lastStateEventNanos = new AtomicLong(System.nanoTime());
     private final Object revisionMonitor = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService screenshotExecutor = Executors.newSingleThreadExecutor();
@@ -61,8 +61,9 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         if (event.getPackageName() != null) packageName = event.getPackageName().toString();
         if (event.getClassName() != null) className = event.getClassName().toString();
         if (!isStateEvent(event.getEventType())) return;
-        revision.incrementAndGet();
         synchronized (revisionMonitor) {
+            revision.incrementAndGet();
+            lastStateEventNanos.set(System.nanoTime());
             revisionMonitor.notifyAll();
         }
     }
@@ -114,31 +115,95 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         return callOnMain(() -> NodeCodec.snapshot(this));
     }
 
-    boolean waitForRevision(long previous, long timeoutMs) throws InterruptedException {
-        if (revision.get() > previous) return true;
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+    JSONObject transitionNow(long previous) throws Exception {
+        long current = revision.get();
+        JSONObject out = new JSONObject();
+        out.put("changed", current > previous);
+        out.put("settled", true);
+        out.put("events", Math.max(0L, current - previous));
+        out.put("revision", current);
+        out.put("quiet_ms", 0L);
+        out.put("wait_ms", 0.0);
+        return out;
+    }
+
+    JSONObject waitForSettledRevision(
+            long previous,
+            long firstChangeTimeoutMs,
+            long quietMs,
+            long maxSettleMs
+    ) throws Exception {
+        long started = System.nanoTime();
+        long firstDeadline = started + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, firstChangeTimeoutMs));
+        long settleDeadline = Long.MAX_VALUE;
+        boolean changed = revision.get() > previous;
+        boolean settled = false;
+
         synchronized (revisionMonitor) {
-            while (revision.get() <= previous) {
-                long remainingNs = deadline - System.nanoTime();
-                if (remainingNs <= 0L) return false;
-                TimeUnit.NANOSECONDS.timedWait(revisionMonitor, remainingNs);
+            while (!changed) {
+                long now = System.nanoTime();
+                long remaining = firstDeadline - now;
+                if (remaining <= 0L) break;
+                TimeUnit.NANOSECONDS.timedWait(revisionMonitor, remaining);
+                changed = revision.get() > previous;
+            }
+
+            if (changed) {
+                settleDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(quietMs, maxSettleMs));
+                long quietNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, quietMs));
+                while (true) {
+                    long now = System.nanoTime();
+                    long quietDeadline = lastStateEventNanos.get() + quietNanos;
+                    if (now >= quietDeadline) {
+                        settled = true;
+                        break;
+                    }
+                    if (now >= settleDeadline) break;
+                    long remaining = Math.min(quietDeadline, settleDeadline) - now;
+                    if (remaining <= 0L) continue;
+                    TimeUnit.NANOSECONDS.timedWait(revisionMonitor, remaining);
+                }
+            } else {
+                settled = true;
             }
         }
-        return true;
+
+        long current = revision.get();
+        JSONObject out = new JSONObject();
+        out.put("changed", changed);
+        out.put("settled", settled);
+        out.put("events", Math.max(0L, current - previous));
+        out.put("revision", current);
+        out.put("quiet_ms", quietMs);
+        out.put("wait_ms", (System.nanoTime() - started) / 1_000_000.0);
+        return out;
     }
 
     JSONArray executeActions(JSONArray actions) throws Exception {
         JSONArray results = new JSONArray();
         for (int index = 0; index < actions.length(); index++) {
-            JSONObject action = actions.getJSONObject(index);
+            JSONObject action = actions.optJSONObject(index);
             long started = System.nanoTime();
-            String detail = executeAction(action);
             JSONObject result = new JSONObject();
-            result.put("ok", true);
+            if (action == null) {
+                result.put("ok", false);
+                result.put("error", "action must be an object");
+                result.put("latency_ms", (System.nanoTime() - started) / 1_000_000.0);
+                results.put(result);
+                break;
+            }
             result.put("action", action);
-            result.put("detail", detail);
+            try {
+                String detail = executeAction(action);
+                result.put("ok", true);
+                result.put("detail", detail);
+            } catch (Exception exc) {
+                result.put("ok", false);
+                result.put("error", safeMessage(exc));
+            }
             result.put("latency_ms", (System.nanoTime() - started) / 1_000_000.0);
             results.put(result);
+            if (!result.optBoolean("ok", false)) break;
         }
         return results;
     }
@@ -198,6 +263,7 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         }
         int x = action.getInt("x");
         int y = action.getInt("y");
+        validatePoint(x, y);
         gesture(x, y, x, y, 50L);
         return x + "," + y;
     }
@@ -220,7 +286,10 @@ public final class BridgeAccessibilityService extends AccessibilityService {
                 node.recycle();
             }
         }
-        gesture(action.getInt("x"), action.getInt("y"), action.getInt("x"), action.getInt("y"), duration);
+        int x = action.getInt("x");
+        int y = action.getInt("y");
+        validatePoint(x, y);
+        gesture(x, y, x, y, duration);
         return "long press";
     }
 
@@ -233,7 +302,13 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         } else {
             node = callOnMain(() -> {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
-                return root == null ? null : root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                if (root == null) return null;
+                try {
+                    AccessibilityNodeInfo focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                    return focused;
+                } finally {
+                    root.recycle();
+                }
             });
         }
         if (node == null) throw new IllegalArgumentException("no editable input target");
@@ -259,7 +334,12 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         } else {
             node = callOnMain(() -> {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
-                return root == null ? null : root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                if (root == null) return null;
+                try {
+                    return root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                } finally {
+                    root.recycle();
+                }
             });
         }
         if (node == null) throw new IllegalArgumentException("no focused editable node for IME enter");
@@ -302,8 +382,14 @@ public final class BridgeAccessibilityService extends AccessibilityService {
     }
 
     private String swipe(JSONObject action) throws Exception {
+        int x1 = action.getInt("x1");
+        int y1 = action.getInt("y1");
+        int x2 = action.getInt("x2");
+        int y2 = action.getInt("y2");
+        validatePoint(x1, y1);
+        validatePoint(x2, y2);
         long duration = Math.max(50L, Math.min(5_000L, action.optLong("duration_ms", 180L)));
-        gesture(action.getInt("x1"), action.getInt("y1"), action.getInt("x2"), action.getInt("y2"), duration);
+        gesture(x1, y1, x2, y2, duration);
         return "swipe";
     }
 
@@ -323,6 +409,12 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         boolean ok = callOnMain(() -> performGlobalAction(action));
         if (!ok) throw new IllegalArgumentException("global action unavailable: " + label);
         return label;
+    }
+
+    private void validatePoint(int x, int y) {
+        if (x < 0 || y < 0 || x >= screenWidth() || y >= screenHeight()) {
+            throw new IllegalArgumentException("gesture coordinate outside display bounds: " + x + "," + y);
+        }
     }
 
     private void gesture(float x1, float y1, float x2, float y2, long durationMs) throws Exception {
@@ -396,5 +488,11 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         if (node.getContentDescription() != null && node.getContentDescription().length() > 0) return node.getContentDescription().toString();
         String viewId = node.getViewIdResourceName();
         return viewId == null ? "" : viewId;
+    }
+
+    private static String safeMessage(Exception exception) {
+        String message = exception.getMessage();
+        if (message == null || message.isEmpty()) return exception.getClass().getSimpleName();
+        return message.length() > 500 ? message.substring(0, 500) : message;
     }
 }
