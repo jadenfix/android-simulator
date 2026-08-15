@@ -52,6 +52,10 @@ class UINode:
     scrollable: bool
     selected: bool
     checked: bool
+    editable: bool = False
+    password: bool = False
+    input_focused: bool = False
+    long_clickable: bool = False
 
     @property
     def label(self) -> str:
@@ -72,12 +76,22 @@ class UINode:
             value["id"] = self.resource_id
         if self.clickable:
             value["clickable"] = True
+        if self.long_clickable:
+            value["long_clickable"] = True
+        if self.editable:
+            value["editable"] = True
         if self.scrollable:
             value["scrollable"] = True
         if self.checked:
             value["checked"] = True
         if self.selected:
             value["selected"] = True
+        if self.input_focused:
+            value["input_focused"] = True
+        if self.password:
+            value["password"] = True
+        if not self.enabled:
+            value["enabled"] = False
         return value
 
 
@@ -91,12 +105,13 @@ class Observation:
     nodes: tuple[UINode, ...]
     captured_at: float
     latency_ms: float
+    revision: int = 0
 
     def _ranked(self, max_nodes: int) -> list[UINode]:
         return sorted(
             self.nodes,
             key=lambda n: (
-                not (n.clickable or n.scrollable),
+                not (n.clickable or n.editable or n.scrollable),
                 not bool(n.label),
                 -n.bounds.area,
                 n.ref,
@@ -117,7 +132,7 @@ class Observation:
         return hashlib.blake2s(payload.encode(), digest_size=12).hexdigest()
 
     def compact(self, *, max_nodes: int = 180) -> dict[str, Any]:
-        return {
+        value = {
             "serial": self.serial,
             "package": self.package,
             "activity": self.activity,
@@ -126,6 +141,9 @@ class Observation:
             "latency_ms": round(self.latency_ms, 1),
             "nodes": [node.compact() for node in self._ranked(max_nodes)],
         }
+        if self.revision:
+            value["revision"] = self.revision
+        return value
 
 
 @dataclass(frozen=True)
@@ -136,12 +154,20 @@ class ActionResult:
     detail: str = ""
 
 
+class StaleStateError(AndroidSimError):
+    def __init__(self, observation: Observation):
+        super().__init__("Android UI changed before the planned action could execute")
+        self.observation = observation
+
+
 class DeviceController:
     """Low-overhead Android computer-use primitives over ADB.
 
-    The hot path is semantic hierarchy -> local selector -> one device-side action transaction.
-    Screenshots are deliberately out of the hot path and only produced for vision fallback.
+    This remains the zero-install fallback. The native accessibility bridge implements the
+    same contract and removes UIAutomator/ADB process startup from the hot path.
     """
+
+    transport_name = "adb-uiautomator"
 
     def __init__(self, toolchain: Toolchain, serial: str):
         self.toolchain = toolchain
@@ -152,7 +178,6 @@ class DeviceController:
         return adb_module.shell(self.toolchain, self.serial, args, check=check, quiet=True)
 
     def _metadata(self) -> tuple[str, str, int, int]:
-        # One adb shell round trip for both size and focused-window metadata.
         raw = self._shell(
             [
                 "sh",
@@ -170,7 +195,6 @@ class DeviceController:
         return package, activity, width, height
 
     def _hierarchy_xml(self) -> str:
-        # /dev/tty avoids the older dump-to-file -> cat sequence and saves an adb round trip.
         xml = self._shell(["uiautomator", "dump", "--compressed", "/dev/tty"], check=False)
         if "<hierarchy" not in xml:
             xml = self._shell(["uiautomator", "dump", "/dev/tty"], check=False)
@@ -193,12 +217,14 @@ class DeviceController:
             left, top, right, bottom = (int(v) for v in match.groups())
             if right <= left or bottom <= top:
                 continue
+            class_name = attrs.get("class", "").strip()
+            password = attrs.get("password") == "true"
             nodes.append(UINode(
                 ref=f"n{index}",
-                text=attrs.get("text", "").strip(),
+                text="" if password else attrs.get("text", "").strip(),
                 content_desc=attrs.get("content-desc", "").strip(),
                 resource_id=attrs.get("resource-id", "").strip(),
-                class_name=attrs.get("class", "").strip(),
+                class_name=class_name,
                 package=attrs.get("package", "").strip(),
                 bounds=Rect(left, top, right, bottom),
                 clickable=attrs.get("clickable") == "true",
@@ -207,12 +233,15 @@ class DeviceController:
                 scrollable=attrs.get("scrollable") == "true",
                 selected=attrs.get("selected") == "true",
                 checked=attrs.get("checked") == "true",
+                editable=attrs.get("editable") == "true" or class_name.endswith("EditText"),
+                password=password,
+                input_focused=attrs.get("focused") == "true",
+                long_clickable=attrs.get("long-clickable") == "true",
             ))
         return tuple(nodes)
 
     def observe(self) -> Observation:
         started = time.perf_counter()
-        # UIAutomator startup dominates the structured observation path, so metadata is collected in parallel.
         with ThreadPoolExecutor(max_workers=2) as executor:
             xml_future = executor.submit(self._hierarchy_xml)
             metadata_future = executor.submit(self._metadata)
@@ -243,15 +272,15 @@ class DeviceController:
 
     def find(self, selector: str, observation: Observation | None = None) -> UINode:
         obs = observation or self._last_observation or self.observe()
-        if selector.startswith("n") and selector[1:].isdigit():
-            for node in obs.nodes:
-                if node.ref == selector:
-                    return node
+        for node in obs.nodes:
+            if node.ref == selector:
+                return node
         needle = selector.casefold()
         candidates = [node for node in obs.nodes if (
             needle in node.text.casefold()
             or needle in node.content_desc.casefold()
             or needle in node.resource_id.casefold()
+            or needle in node.label.casefold()
         )]
         if not candidates:
             raise AndroidSimError(f"No UI node matches {selector!r}")
@@ -297,6 +326,10 @@ class DeviceController:
                 return "input keyevent KEYCODE_BACK", detail
             if kind == "home":
                 return "input keyevent KEYCODE_HOME", detail
+            if kind == "recents":
+                return "input keyevent KEYCODE_APP_SWITCH", detail
+            if kind == "notifications":
+                return "cmd statusbar expand-notifications", detail
             if kind == "enter":
                 return "input keyevent KEYCODE_ENTER", detail
             if kind == "swipe":
@@ -310,8 +343,15 @@ class DeviceController:
                 amount = max(0.1, min(float(action.get("amount", 0.62)), 0.8))
                 x = width // 2
                 hi, lo = int(height * 0.78), int(height * max(0.12, 0.78 - amount))
-                y1, y2 = (hi, lo) if direction == "down" else (lo, hi)
-                return f"input swipe {x} {y1} {x} {y2} 180", detail
+                if direction == "up":
+                    x1, y1, x2, y2 = x, lo, x, hi
+                elif direction == "left":
+                    x1, y1, x2, y2 = int(width * 0.24), height // 2, int(width * 0.78), height // 2
+                elif direction == "right":
+                    x1, y1, x2, y2 = int(width * 0.78), height // 2, int(width * 0.24), height // 2
+                else:
+                    x1, y1, x2, y2 = x, hi, x, lo
+                return f"input swipe {x1} {y1} {x2} {y2} 180", detail
             if kind == "launch":
                 package = shlex.quote(str(action["package"]))
                 return f"monkey -p {package} -c android.intent.category.LAUNCHER 1 >/dev/null", detail
@@ -357,10 +397,28 @@ class DeviceController:
             for action, detail in zip(batch, details)
         ]
 
+    def act_and_observe(
+        self,
+        actions: Iterable[dict[str, Any]],
+        observation: Observation,
+        *,
+        timeout_ms: int = 900,
+    ) -> tuple[list[ActionResult], Observation]:
+        self._last_observation = observation
+        results = self.macro(actions)
+        # UIAutomator has no event channel. A short bounded settle avoids immediately reading a pre-action frame.
+        if timeout_ms > 0:
+            time.sleep(min(timeout_ms, 120) / 1000.0)
+        return results, self.observe()
+
 
 def action_schema() -> dict[str, Any]:
     return {
-        "types": ["tap", "long_press", "type", "key", "back", "home", "enter", "swipe", "scroll", "launch", "wait"],
+        "types": [
+            "tap", "long_press", "type", "key", "back", "home", "recents",
+            "notifications", "enter", "swipe", "scroll", "launch", "wait"
+        ],
         "selector": "Prefer ref from observation. text/resource-id/content-description selectors are also accepted.",
         "batching": "Batch deterministic non-selector follow-ups; only one semantic selector action is allowed per state.",
+        "revision": "Native bridge actions are rejected if the observed UI revision changed before execution.",
     }
