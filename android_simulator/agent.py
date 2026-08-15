@@ -43,11 +43,7 @@ class AgentRun:
 
 
 class PlannerClient:
-    """Tiny model-agnostic client for OpenAI-compatible chat endpoints.
-
-    Keeping this adapter dependency-free means local vLLM/Ollama-compatible gateways, hosted
-    endpoints, or a Tempera routing layer can all be swapped in with environment variables.
-    """
+    """Dependency-free client for OpenAI-compatible chat endpoints."""
 
     def __init__(self, config: AgentConfig):
         self.config = config
@@ -103,17 +99,17 @@ class PlannerClient:
     ) -> dict[str, Any]:
         system = (
             "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the UI tree over coordinates. "
-            "Batch deterministic actions to reduce latency, but stop batching whenever the result of an action affects "
-            "what should happen next. Never invent a ref. If the hierarchy is insufficient and an image would help, set "
-            "need_vision=true and actions=[]. If the task is complete, set done=true. Schema: "
-            "{done:boolean, summary:string, need_vision:boolean, actions:[action...]}. Action schema: "
+            "Batch deterministic actions to reduce latency, but never include a second ref/selector action after a prior "
+            "ref/selector action in the same batch because semantic refs are scoped to one UI state. It is okay to batch "
+            "non-selector follow-ups such as type, enter, wait, key, or coordinate gestures. Never invent a ref. If the "
+            "hierarchy is insufficient and an image would help, set need_vision=true and actions=[]. If the task is complete, "
+            "set done=true. Schema: {done:boolean, summary:string, need_vision:boolean, actions:[action...]}. Action schema: "
             + json.dumps(action_schema(), separators=(",", ":"))
         )
-        compact_history = history[-6:]
         text = json.dumps({
             "task": task,
             "observation": observation.compact(),
-            "recent_history": compact_history,
+            "recent_history": history[-6:],
         }, separators=(",", ":"))
         if screenshot is None:
             user_content: Any = text
@@ -142,6 +138,19 @@ def _sensitive(action: dict[str, Any], observation: Observation) -> str | None:
             if any(term in label for term in SENSITIVE_LABELS):
                 return node.label or ref
     return None
+
+
+def _safe_batch(actions: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Trim a planner batch before it can reuse semantic selectors in a new UI state."""
+    result: list[dict[str, Any]] = []
+    selector_seen = False
+    for action in actions[:limit]:
+        uses_selector = bool(action.get("ref") or action.get("selector"))
+        if uses_selector and selector_seen:
+            break
+        result.append(action)
+        selector_seen = selector_seen or uses_selector
+    return result
 
 
 class ComputerUseAgent:
@@ -179,11 +188,13 @@ class ComputerUseAgent:
             actions = plan.get("actions")
             if not isinstance(actions, list) or not actions:
                 raise AndroidSimError(f"Planner returned no executable actions at step {step}: {plan}")
-            actions = actions[: self.config.max_actions_per_step]
+            if not all(isinstance(action, dict) for action in actions):
+                raise AndroidSimError(f"Planner returned an invalid action batch: {actions!r}")
+            actions = _safe_batch(actions, self.config.max_actions_per_step)
+            if not actions:
+                raise AndroidSimError("Planner batch became empty after safety validation")
 
             for action in actions:
-                if not isinstance(action, dict):
-                    raise AndroidSimError(f"Invalid action from planner: {action!r}")
                 sensitive = _sensitive(action, observation)
                 if sensitive and not self.config.auto_approve_sensitive:
                     raise AndroidSimError(
@@ -200,8 +211,6 @@ class ComputerUseAgent:
                     "latency_ms": round(result.latency_ms, 1),
                     "detail": result.detail,
                 })
-                # A selector ref belongs to the pre-action hierarchy. Do not reuse it for subsequent actions.
-                observation = self.controller.observe() if (action.get("ref") or action.get("selector")) else observation
 
             if repeated_states >= 4:
                 raise AndroidSimError("Agent is stuck: UI state repeated without progress")
