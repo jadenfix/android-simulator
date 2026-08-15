@@ -68,22 +68,21 @@ final class NodeCodec {
                 AccessibilityWindowInfo window = windows.get(index);
                 if (window == null) continue;
                 AccessibilityNodeInfo root = null;
+                boolean returnRoot = false;
                 try {
                     root = window.getRoot();
                     if (root == null) continue;
                     AccessibilityNodeInfo found = find(root, "w" + window.getId() + ":0", ref);
-                    if (found != null) {
-                        if (found != root) root.recycle();
-                        return found;
+                    if (found == null) continue;
+                    if (found == root) {
+                        returnRoot = true;
+                        return root;
                     }
+                    root.recycle();
+                    root = null;
+                    return found;
                 } finally {
-                    if (root != null && !stableRef(root, "w" + window.getId() + ":0").equals(ref)) {
-                        // The root is recycled above when a descendant is returned, or here when no match exists.
-                        try {
-                            root.recycle();
-                        } catch (Exception ignored) {
-                        }
-                    }
+                    if (root != null && !returnRoot) root.recycle();
                     window.recycle();
                 }
             }
@@ -93,18 +92,12 @@ final class NodeCodec {
         AccessibilityNodeInfo root = service.getRootInActiveWindow();
         if (root == null) return null;
         AccessibilityNodeInfo found = find(root, "0", ref);
-        if (found == null) {
-            root.recycle();
-        } else if (found != root) {
-            root.recycle();
-        }
+        if (found == null || found != root) root.recycle();
         return found;
     }
 
     private static AccessibilityNodeInfo find(AccessibilityNodeInfo node, String path, String wanted) {
-        if (stableRef(node, path).equals(wanted)) {
-            return node;
-        }
+        if (stableRef(node, path).equals(wanted)) return node;
         int children = node.getChildCount();
         for (int index = 0; index < children; index++) {
             AccessibilityNodeInfo child = node.getChild(index);
