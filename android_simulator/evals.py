@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import statistics
 import time
@@ -14,6 +15,14 @@ from .computer_use import DeviceController, Observation
 
 
 FIXTURE_COMPONENT = f"{PACKAGE}/.EvalFixtureActivity"
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -138,7 +147,6 @@ def _setup_case(controller: DeviceController, case: EvalCase) -> None:
         controller.act({"type": "home"})
     else:
         raise ValueError(f"unknown eval setup: {case.setup}")
-    # Give the reset transition a small deterministic boundary before the independent observation.
     time.sleep(0.12)
     controller.observe()
 
@@ -166,6 +174,12 @@ def _case_metrics(history: list[dict[str, Any]], wall_ms: float) -> dict[str, An
         "actions": len(actions),
         "program_actions": _count(history, "program_action"),
         "program_aborts": _count(history, "program_abort"),
+        "skill_attempts": _count(history, "skill_attempt"),
+        "skill_actions": _count(history, "skill_action"),
+        "skill_hits": _count(history, "skill_hit"),
+        "skill_rejections": _count(history, "skill_rejected"),
+        "skills_learned": _count(history, "skill_learned"),
+        "completion_rejects": _count(history, "completion_rejected"),
         "stale_rejects": _count(history, "stale_plan_rejected"),
         "vision_calls": sum(item.get("perception") == "vision" for item in plans),
     }
@@ -190,8 +204,11 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_model_calls": _mean(subset, "model_calls"),
             "mean_actions": _mean(subset, "actions"),
             "mean_program_actions": _mean(subset, "program_actions"),
+            "mean_skill_actions": _mean(subset, "skill_actions"),
+            "skill_hits": int(sum(row["metrics"]["skill_hits"] for row in subset)),
             "vision_calls": int(sum(row["metrics"]["vision_calls"] for row in subset)),
             "stale_rejects": int(sum(row["metrics"]["stale_rejects"] for row in subset)),
+            "completion_rejects": int(sum(row["metrics"]["completion_rejects"] for row in subset)),
         }
     successes = sum(bool(row["success"]) for row in rows)
     return {
@@ -201,6 +218,8 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_wall_ms": _mean(rows, "wall_ms"),
         "mean_model_calls": _mean(rows, "model_calls"),
         "mean_actions": _mean(rows, "actions"),
+        "skill_hits": int(sum(row["metrics"]["skill_hits"] for row in rows)),
+        "vision_calls": int(sum(row["metrics"]["vision_calls"] for row in rows)),
         "by_population": by_population,
     }
 
@@ -219,6 +238,7 @@ def run_eval_suite(
 ) -> dict[str, Any]:
     selected = tuple(cases or builtin_cases(include_settings=include_settings))
     results: list[dict[str, Any]] = []
+    started_at = datetime.now(timezone.utc).isoformat()
 
     for case in selected:
         _setup_case(controller, case)
@@ -237,7 +257,7 @@ def run_eval_suite(
             agent_done = run.done
             summary = run.summary
             history = run.history
-        except Exception as exc:  # Eval harness records failures instead of aborting the population.
+        except Exception as exc:
             run_error = f"{type(exc).__name__}: {exc}"
         wall_ms = (time.perf_counter() - started) * 1000
 
@@ -259,21 +279,36 @@ def run_eval_suite(
             "agent_summary": summary,
             "error": run_error or None,
             "metrics": _case_metrics(history, wall_ms),
-            # History contains redacted typed-text receipts by construction.
             "history": history,
         })
 
-    return {
+    finished_at = datetime.now(timezone.utc).isoformat()
+    populations = sorted({case.population for case in selected})
+    case_ids = [case.id for case in selected]
+    report: dict[str, Any] = {
         "schema_version": "android-agent-eval.v1",
         "suite": {
             "id": "android.computer-use.local-v1",
             "case_count": len(results),
-            "populations": ["synthetic_fixture", "android_settings"] if include_settings else ["synthetic_fixture"],
+            "case_ids_sha256": _sha(case_ids),
+            "populations": populations,
         },
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": started_at,
+        "finished_at": finished_at,
         "transport": controller.transport_name,
         "model": base_config.model,
         "vision_model": base_config.vision_model or base_config.model,
+        "agent_config": {
+            "max_steps": base_config.max_steps,
+            "max_actions_per_step": base_config.max_actions_per_step,
+            "max_program_steps": base_config.max_program_steps,
+            "task_context_nodes": base_config.task_context_nodes,
+            "full_context_nodes": base_config.full_context_nodes,
+            "settle_timeout_ms": base_config.settle_timeout_ms,
+            "use_vision": base_config.use_vision,
+            "require_completion_evidence": base_config.require_completion_evidence,
+            "use_skill_cache": base_config.use_skill_cache,
+        },
         "result": {
             "aggregate": _aggregate(results),
             "cases": results,
@@ -283,9 +318,12 @@ def run_eval_suite(
             "Synthetic fixture cases prove control-plane behavior, not arbitrary third-party app capability.",
             "Android Settings labels may vary by Android release, OEM image, and locale; run the suite on the target AVD image.",
             "The model's done flag is recorded but never used as the success grader.",
+            "Skill-cache results must be reported separately from cold planner results when making latency comparisons.",
             "No 10x performance claim is valid without equal-or-better deterministic success on the target M2 task population.",
         ],
     }
+    report["report_sha256"] = _sha(report)
+    return report
 
 
 def dumps_eval_report(report: dict[str, Any]) -> str:
