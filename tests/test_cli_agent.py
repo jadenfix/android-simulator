@@ -19,11 +19,30 @@ class AgentCliTests(unittest.TestCase):
             "run", "Open Settings",
             "--task-context-nodes", "48",
             "--full-context-nodes", "320",
+            "--max-program-steps", "4",
         ])
         self.assertEqual(args.model, "fast-model")
         self.assertEqual(args.vision_model, "vision-model")
         self.assertEqual(args.task_context_nodes, 48)
         self.assertEqual(args.full_context_nodes, 320)
+        self.assertEqual(args.max_program_steps, 4)
+
+    def test_eval_parser_supports_case_selection(self):
+        args = build_parser().parse_args([
+            "--model", "fast-model",
+            "eval",
+            "--synthetic-only",
+            "--case", "fixture.dialog-multiwindow",
+            "--case", "fixture.long-scroll",
+            "--output", "report.json",
+        ])
+        self.assertEqual(args.command, "eval")
+        self.assertTrue(args.synthetic_only)
+        self.assertEqual(
+            args.case,
+            ["fixture.dialog-multiwindow", "fixture.long-scroll"],
+        )
+        self.assertEqual(str(args.output), "report.json")
 
 
 if __name__ == "__main__":
