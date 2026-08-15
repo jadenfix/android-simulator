@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/companion"
 BUILD="$APP/build"
 ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
+COMPILE_SDK="${ANDROID_AGENT_COMPILE_SDK:-36}"
 
 if [[ ! -d "$ANDROID_SDK_ROOT" ]]; then
   echo "Android SDK not found at $ANDROID_SDK_ROOT" >&2
@@ -27,7 +28,7 @@ PY
 }
 
 BUILD_TOOLS="$(latest_dir "$ANDROID_SDK_ROOT/build-tools")"
-PLATFORM="$(latest_dir "$ANDROID_SDK_ROOT/platforms")"
+PLATFORM="$ANDROID_SDK_ROOT/platforms/android-$COMPILE_SDK"
 AAPT2="$BUILD_TOOLS/aapt2"
 D8="$BUILD_TOOLS/d8"
 ZIPALIGN="$BUILD_TOOLS/zipalign"
@@ -67,9 +68,9 @@ fi
   --manifest "$APP/AndroidManifest.xml" \
   --java "$BUILD/gen" \
   --min-sdk-version 30 \
-  --target-sdk-version 37 \
-  --version-code 2 \
-  --version-name 0.2.0 \
+  --target-sdk-version "$COMPILE_SDK" \
+  --version-code 3 \
+  --version-name 0.3.0 \
   "${resources[@]}"
 
 java_sources=()
