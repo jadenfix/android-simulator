@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jadenfix-android-simulator"
-version = "0.1.0"
-description = "Reproducible Android Emulator environments for Apple Silicon Macs"
+version = "0.2.0"
+description = "Reproducible Android Emulator environments and fast computer-use agents for Apple Silicon Macs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Jadenfix" }]
-keywords = ["android", "emulator", "apple-silicon", "macos", "avd", "adb"]
+keywords = ["android", "emulator", "apple-silicon", "macos", "avd", "adb", "computer-use", "agent", "mcp"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: MacOS X",
@@ -26,6 +26,7 @@ dependencies = []
 
 [project.scripts]
 android-sim = "android_simulator.cli:main"
+android-agent = "android_simulator.agent_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["android_simulator*"]
