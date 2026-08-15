@@ -20,6 +20,7 @@ from .computer_use import action_schema
 from .config import discover_toolchain
 from .errors import AndroidSimError
 from .evals import builtin_cases, dumps_eval_report, run_eval_suite
+from .secrets import load_secret_capabilities
 from .tempera_evals import external_adapter_result
 
 
@@ -31,7 +32,19 @@ def _add_agent_tuning(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--full-context-nodes", type=int, default=360)
     parser.add_argument("--settle-timeout-ms", type=int, default=900)
     parser.add_argument("--no-vision", action="store_true")
+    parser.add_argument(
+        "--allow-password-vision",
+        action="store_true",
+        help="Explicitly allow screenshot fallback while a password field is present",
+    )
     parser.add_argument("--approve-sensitive", action="store_true")
+    parser.add_argument(
+        "--secret",
+        action="append",
+        default=[],
+        metavar="NAME=ENV_VAR",
+        help="Authorize a local secret alias without putting its value in argv",
+    )
     parser.add_argument("--skills", action="store_true", help="Enable opt-in persistent navigation-skill replay")
     parser.add_argument("--skill-cache", type=Path, help="Override the private local navigation-skill cache path")
 
@@ -48,10 +61,12 @@ def _agent_config(args: argparse.Namespace) -> AgentConfig:
         task_context_nodes=max(16, min(args.task_context_nodes, 240)),
         full_context_nodes=max(64, min(args.full_context_nodes, 600)),
         use_vision=not args.no_vision,
+        allow_password_vision=bool(args.allow_password_vision),
         auto_approve_sensitive=args.approve_sensitive,
         settle_timeout_ms=max(0, min(args.settle_timeout_ms, 5000)),
         use_skill_cache=bool(args.skills),
         skill_cache_path=str(args.skill_cache.expanduser()) if args.skill_cache else "",
+        secret_values=load_secret_capabilities(args.secret),
     )
 
 
