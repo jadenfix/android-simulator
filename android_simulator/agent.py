@@ -201,12 +201,15 @@ class ComputerUseAgent:
                         f"Approval required before sensitive UI action {sensitive!r}. "
                         "Re-run with --approve-sensitive if this task is intentionally authorized."
                     )
-                result = self.controller.act(action, observation)
-                total_actions += 1
+
+            # The controller compiles the full safe batch into one device-side shell transaction.
+            results = self.controller.macro(actions, max_actions=self.config.max_actions_per_step)
+            total_actions += len(results)
+            for result in results:
                 history.append({
                     "step": step,
                     "state": observation.state_hash,
-                    "action": action,
+                    "action": result.action,
                     "ok": result.ok,
                     "latency_ms": round(result.latency_ms, 1),
                     "detail": result.detail,
