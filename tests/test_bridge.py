@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from android_simulator.bridge import BridgeController
-from android_simulator.computer_use import Observation, Rect, StaleStateError, UINode
+from android_simulator.computer_use import StaleStateError
 
 
 class FakeClient:
@@ -23,6 +23,7 @@ class FakeClient:
                 {
                     "ref": "babc",
                     "label": "Settings",
+                    "text": "Settings",
                     "id": "com.demo:id/settings",
                     "class": "Button",
                     "bounds": [10, 20, 210, 120],
