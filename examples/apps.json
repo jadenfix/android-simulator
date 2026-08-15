@@ -1,0 +1,16 @@
+{
+  "notes": [
+    "Use `android-sim play <package>` for official Google Play installation.",
+    "Use `android-sim install-url <https-url> --sha256 <digest>` for a trusted direct APK."
+  ],
+  "play_packages": [
+    "com.spotify.music",
+    "com.google.android.youtube"
+  ],
+  "direct_apks": [
+    {
+      "url": "https://example.invalid/app.apk",
+      "sha256": "replace-with-the-publisher-provided-sha256"
+    }
+  ]
+}
