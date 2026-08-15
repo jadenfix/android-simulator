@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .computer_use import DeviceController, Observation, action_schema
+from .computer_use import DeviceController, Observation, StaleStateError, action_schema
 from .errors import AndroidSimError
 
 
@@ -30,6 +30,7 @@ class AgentConfig:
     max_actions_per_step: int = 8
     use_vision: bool = True
     auto_approve_sensitive: bool = False
+    settle_timeout_ms: int = 900
 
 
 @dataclass
@@ -100,10 +101,11 @@ class PlannerClient:
         system = (
             "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the UI tree over coordinates. "
             "Batch deterministic actions to reduce latency, but never include a second ref/selector action after a prior "
-            "ref/selector action in the same batch because semantic refs are scoped to one UI state. It is okay to batch "
-            "non-selector follow-ups such as type, enter, wait, key, or coordinate gestures. Never invent a ref. If the "
-            "hierarchy is insufficient and an image would help, set need_vision=true and actions=[]. If the task is complete, "
-            "set done=true. Schema: {done:boolean, summary:string, need_vision:boolean, actions:[action...]}. Action schema: "
+            "ref/selector action in the same batch because selectors describe one observed state. It is okay to batch "
+            "non-selector follow-ups such as type, enter, wait, key, or coordinate gestures. Never invent a ref. "
+            "Password node text is deliberately redacted. If the semantic hierarchy is insufficient and pixels would help, "
+            "set need_vision=true and actions=[]. If the task is complete, set done=true. Schema: "
+            "{done:boolean, summary:string, need_vision:boolean, actions:[action...]}. Action schema: "
             + json.dumps(action_schema(), separators=(",", ":"))
         )
         text = json.dumps({
@@ -164,8 +166,10 @@ class ComputerUseAgent:
         total_actions = 0
         last_hash = ""
         repeated_states = 0
+        stale_replans = 0
+        observation = self.controller.observe()
+
         for step in range(1, self.config.max_steps + 1):
-            observation = self.controller.observe()
             if observation.state_hash == last_hash:
                 repeated_states += 1
             else:
@@ -202,17 +206,40 @@ class ComputerUseAgent:
                         "Re-run with --approve-sensitive if this task is intentionally authorized."
                     )
 
-            # The controller compiles the full safe batch into one device-side shell transaction.
-            results = self.controller.macro(actions, max_actions=self.config.max_actions_per_step)
+            before = observation
+            try:
+                results, observation = self.controller.act_and_observe(
+                    actions,
+                    before,
+                    timeout_ms=self.config.settle_timeout_ms,
+                )
+            except StaleStateError as exc:
+                stale_replans += 1
+                observation = exc.observation
+                history.append({
+                    "step": step,
+                    "state": before.state_hash,
+                    "event": "stale_plan_rejected",
+                    "next_state": observation.state_hash,
+                    "revision": observation.revision,
+                })
+                if stale_replans > 8:
+                    raise AndroidSimError("UI changed too frequently to execute a stable plan")
+                continue
+
+            stale_replans = 0
             total_actions += len(results)
             for result in results:
                 history.append({
                     "step": step,
-                    "state": observation.state_hash,
+                    "state": before.state_hash,
+                    "revision": before.revision,
                     "action": result.action,
                     "ok": result.ok,
                     "latency_ms": round(result.latency_ms, 1),
                     "detail": result.detail,
+                    "next_state": observation.state_hash,
+                    "next_revision": observation.revision,
                 })
 
             if repeated_states >= 4:
