@@ -33,6 +33,10 @@ def obs(revision: int, label: str = "Settings", *, nodes: tuple[UINode, ...] | N
     return Observation("emulator-5554", "com.demo", ".Main", 1080, 1920, values, 1.0, 1.0, revision)
 
 
+def done(label: str, summary: str = "done") -> dict:
+    return {"done": True, "summary": summary, "evidence": {"exact": [label]}, "actions": []}
+
+
 class FakePlanner:
     def __init__(self, plans):
         self.plans = list(plans)
@@ -89,7 +93,7 @@ class AgentTests(unittest.TestCase):
         planner = FakePlanner([
             {"done": False, "need_context": True, "need_vision": False, "actions": []},
             {"done": False, "need_context": False, "need_vision": False, "actions": [{"type": "tap", "ref": "b1"}]},
-            {"done": True, "summary": "done", "actions": []},
+            done("Settings"),
         ])
         config = AgentConfig(model="fake", use_vision=False, max_steps=3)
         result = ComputerUseAgent(controller, planner, config).run("Open Settings")
@@ -97,13 +101,14 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(planner.calls[0][0], "ranked")
         self.assertEqual(planner.calls[1][0], "full")
         self.assertEqual(len(controller.actions), 1)
+        self.assertTrue(any(item.get("event") == "completion_accepted" for item in result.history))
 
     def test_vision_is_last_perception_tier(self):
         controller = FakeController([obs(1), obs(2)])
         planner = FakePlanner([
             {"done": False, "need_context": False, "need_vision": True, "actions": []},
             {"done": False, "need_context": False, "need_vision": False, "actions": [{"type": "tap", "ref": "b1"}]},
-            {"done": True, "summary": "done", "actions": []},
+            done("Settings"),
         ])
         config = AgentConfig(model="fast", vision_model="vision", max_steps=3)
         result = ComputerUseAgent(controller, planner, config).run("Open Settings")
@@ -117,7 +122,7 @@ class AgentTests(unittest.TestCase):
         planner = FakePlanner([
             {"done": False, "actions": [{"type": "tap", "ref": "b1"}]},
             {"done": False, "actions": [{"type": "tap", "ref": "b1"}]},
-            {"done": True, "summary": "done", "actions": []},
+            done("Settings"),
         ])
         config = AgentConfig(model="fake", max_steps=4)
         result = ComputerUseAgent(controller, planner, config).run("Open Settings")
@@ -143,7 +148,7 @@ class AgentTests(unittest.TestCase):
                 ],
                 "actions": [],
             },
-            {"done": True, "summary": "reached Internet", "actions": []},
+            done("Internet", "reached Internet"),
         ])
         result = ComputerUseAgent(controller, planner, AgentConfig(model="fake", max_steps=3)).run("Open Internet settings")
         self.assertTrue(result.done)
@@ -156,7 +161,7 @@ class AgentTests(unittest.TestCase):
         controller = FakeController([ambiguous])
         planner = FakePlanner([
             {"done": False, "program": [{"action": {"type": "tap", "selector": "Continue"}}], "actions": []},
-            {"done": True, "summary": "stopped safely", "actions": []},
+            {"done": True, "summary": "stopped safely", "evidence": {"refs": ["a"]}, "actions": []},
         ])
         result = ComputerUseAgent(controller, planner, AgentConfig(model="fake", max_steps=3)).run("Continue")
         self.assertTrue(result.done)
@@ -168,12 +173,26 @@ class AgentTests(unittest.TestCase):
         controller = FakeController([obs(1, nodes=(node("field", "Email", editable=True),)), obs(2, "Done")])
         planner = FakePlanner([
             {"done": False, "actions": [{"type": "type", "ref": "field", "text": "secret@example.com"}]},
-            {"done": True, "summary": "done", "actions": []},
+            done("Done"),
         ])
         result = ComputerUseAgent(controller, planner, AgentConfig(model="fake", max_steps=3)).run("Enter email")
         action_rows = [item for item in result.history if isinstance(item.get("action"), dict)]
         self.assertEqual(action_rows[0]["action"]["text"], "<redacted:18 chars>")
         self.assertNotIn("secret@example.com", str(result.history))
+
+    def test_ungrounded_done_is_rejected_and_replanned_with_full_context(self):
+        controller = FakeController([obs(1, "Settings")])
+        planner = FakePlanner([
+            {"done": True, "summary": "claimed", "actions": []},
+            done("Settings", "grounded"),
+        ])
+        result = ComputerUseAgent(controller, planner, AgentConfig(model="fake", max_steps=3)).run("Open Settings")
+        self.assertTrue(result.done)
+        self.assertEqual(result.summary, "grounded")
+        self.assertEqual(planner.calls[0][0], "ranked")
+        self.assertEqual(planner.calls[1][0], "full")
+        self.assertEqual(sum(item.get("event") == "completion_rejected" for item in result.history), 1)
+        self.assertEqual(sum(item.get("event") == "completion_accepted" for item in result.history), 1)
 
 
 if __name__ == "__main__":
