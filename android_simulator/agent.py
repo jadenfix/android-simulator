@@ -14,6 +14,7 @@ from typing import Any
 from .computer_use import DeviceController, Observation, StaleStateError, action_schema
 from .errors import AndroidSimError
 from .perception import compact_for_task
+from .program import ground_program_action, guard_matches, program_contract
 
 
 SENSITIVE_LABELS = {
@@ -31,6 +32,7 @@ class AgentConfig:
     timeout_seconds: float = 45.0
     max_steps: int = 40
     max_actions_per_step: int = 8
+    max_program_steps: int = 6
     task_context_nodes: int = 72
     full_context_nodes: int = 360
     use_vision: bool = True
@@ -122,21 +124,27 @@ class PlannerClient:
         else:
             raise AndroidSimError(f"Unknown planner context mode: {context_mode}")
 
+        contract = program_contract(self.config.max_program_steps)
         system = (
-            "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the UI tree over coordinates. "
-            "Batch deterministic actions to reduce latency, but never include a second ref/selector action after a prior "
-            "ref/selector action in the same batch because selectors describe one observed state. It is okay to batch "
-            "non-selector follow-ups such as type, enter, wait, key, or coordinate gestures. Never invent a ref. "
+            "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the current UI tree over coordinates. "
+            "For a one-state action batch, never include a second ref/selector action after a prior ref/selector action because "
+            "those refs describe one observed state. It is okay to batch deterministic non-selector follow-ups. Never invent a ref. "
             "Password node text is deliberately redacted. The first semantic view may be task-ranked and incomplete. "
-            "If more semantic nodes are needed, set need_context=true with actions=[]. If pixels are required after semantic "
-            "context is sufficient, set need_vision=true with actions=[]. If the task is complete, set done=true. Schema: "
-            "{done:boolean, summary:string, need_context:boolean, need_vision:boolean, actions:[action...]}. Action schema: "
-            + json.dumps(action_schema(), separators=(",", ":"))
+            "If more semantic nodes are needed, set need_context=true with actions=[] and program=[]. If pixels are required, "
+            "set need_vision=true with actions=[] and program=[]. If the task is complete, set done=true. "
+            "For obvious multi-screen flows, you MAY return a guarded program instead of actions. Program future-state targeted "
+            "actions must use exact human-visible selector strings, never refs or coordinates. Each program step is freshly grounded "
+            "against a settled state and aborts/replans on guard failure, ambiguity, stale state, failed action, or no UI change. "
+            "Do not return both non-empty actions and program. Schema: "
+            "{done:boolean, summary:string, need_context:boolean, need_vision:boolean, actions:[action...], "
+            "program:[{when:{package?:string,activity?:string,contains?:[string],absent?:[string]},action:action}]}. "
+            "Action schema: " + json.dumps(action_schema(), separators=(",", ":")) + ". Program contract: "
+            + json.dumps(contract, separators=(",", ":"))
         )
         text = json.dumps({
             "task": task,
             "observation": semantic,
-            "recent_history": history[-6:],
+            "recent_history": history[-8:],
         }, separators=(",", ":"))
         if screenshot is None:
             user_content: Any = text
@@ -182,6 +190,15 @@ def _safe_batch(actions: list[dict[str, Any]], limit: int) -> list[dict[str, Any
     return result
 
 
+def _history_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Keep execution history useful without replaying typed content into later prompts."""
+    value = dict(action)
+    if value.get("type") == "type" and "text" in value:
+        text = str(value.get("text", ""))
+        value["text"] = f"<redacted:{len(text)} chars>"
+    return value
+
+
 class ComputerUseAgent:
     def __init__(self, controller: DeviceController, planner: PlannerClient, config: AgentConfig):
         self.controller = controller
@@ -209,6 +226,110 @@ class ComputerUseAgent:
                 screenshot.unlink(missing_ok=True)
         return plan
 
+    def _transition(self) -> dict[str, Any]:
+        value = getattr(self.controller, "last_transition", None)
+        return dict(value) if isinstance(value, dict) else {}
+
+    def _require_sensitive_approval(self, action: dict[str, Any], observation: Observation) -> None:
+        sensitive = _sensitive(action, observation)
+        if sensitive and not self.config.auto_approve_sensitive:
+            raise AndroidSimError(
+                f"Approval required before sensitive UI action {sensitive!r}. "
+                "Re-run with --approve-sensitive if this task is intentionally authorized."
+            )
+
+    def _execute_program(
+        self,
+        program: list[Any],
+        observation: Observation,
+        history: list[dict[str, Any]],
+        outer_step: int,
+    ) -> tuple[Observation, int]:
+        current = observation
+        total_actions = 0
+        for index, raw_step in enumerate(program[: self.config.max_program_steps]):
+            if not isinstance(raw_step, dict):
+                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "step_not_object"})
+                break
+            if not guard_matches(current, raw_step.get("when")):
+                history.append({
+                    "step": outer_step,
+                    "event": "program_abort",
+                    "program_index": index,
+                    "reason": "guard_mismatch",
+                    "state": current.state_hash,
+                    "revision": current.revision,
+                })
+                break
+            action, reason = ground_program_action(raw_step.get("action"), current)
+            if action is None:
+                history.append({
+                    "step": outer_step,
+                    "event": "program_abort",
+                    "program_index": index,
+                    "reason": reason,
+                    "state": current.state_hash,
+                    "revision": current.revision,
+                })
+                break
+
+            self._require_sensitive_approval(action, current)
+            before = current
+            try:
+                results, current = self.controller.act_and_observe(
+                    [action],
+                    before,
+                    timeout_ms=self.config.settle_timeout_ms,
+                )
+            except StaleStateError as exc:
+                current = exc.observation
+                history.append({
+                    "step": outer_step,
+                    "event": "program_abort",
+                    "program_index": index,
+                    "reason": "stale_state",
+                    "state": before.state_hash,
+                    "next_state": current.state_hash,
+                    "revision": current.revision,
+                })
+                break
+
+            transition = self._transition()
+            total_actions += len(results)
+            if not results:
+                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "missing_receipt"})
+                break
+            result = results[0]
+            history.append({
+                "step": outer_step,
+                "event": "program_action",
+                "program_index": index,
+                "state": before.state_hash,
+                "revision": before.revision,
+                "action": _history_action(result.action),
+                "ok": result.ok,
+                "latency_ms": round(result.latency_ms, 1),
+                "detail": result.detail,
+                "next_state": current.state_hash,
+                "next_revision": current.revision,
+                "transition": transition,
+            })
+            if not result.ok:
+                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "action_failed"})
+                break
+            if action.get("type") != "wait" and transition.get("changed") is False:
+                history.append({"step": outer_step, "event": "program_abort", "program_index": index, "reason": "no_state_change"})
+                break
+
+        if len(program) > self.config.max_program_steps:
+            history.append({
+                "step": outer_step,
+                "event": "program_truncated",
+                "planned_steps": len(program),
+                "limit": self.config.max_program_steps,
+            })
+        return current, total_actions
+
     def run(self, task: str) -> AgentRun:
         history: list[dict[str, Any]] = []
         total_actions = 0
@@ -225,6 +346,8 @@ class ComputerUseAgent:
             last_hash = observation.state_hash
 
             plan = self._plan(task, observation, history)
+            actions_value = plan.get("actions") or []
+            program_value = plan.get("program") or []
             history.append({
                 "step": step,
                 "event": "plan",
@@ -233,28 +356,35 @@ class ComputerUseAgent:
                 "perception": plan.get("_perception"),
                 "planner_model": plan.get("_planner_model"),
                 "planner_latency_ms": plan.get("_planner_latency_ms"),
-                "planned_actions": len(plan.get("actions") or []),
+                "planned_actions": len(actions_value) if isinstance(actions_value, list) else -1,
+                "planned_program_steps": len(program_value) if isinstance(program_value, list) else -1,
             })
 
             if bool(plan.get("done")):
                 return AgentRun(task, True, str(plan.get("summary", "done")), step, total_actions, history)
 
-            actions = plan.get("actions")
-            if not isinstance(actions, list) or not actions:
+            if not isinstance(actions_value, list) or not isinstance(program_value, list):
+                raise AndroidSimError("Planner actions and program must be arrays")
+            if actions_value and program_value:
+                raise AndroidSimError("Planner must return either actions or a guarded program, not both")
+
+            if program_value:
+                observation, executed = self._execute_program(program_value, observation, history, step)
+                total_actions += executed
+                if repeated_states >= 4:
+                    raise AndroidSimError("Agent is stuck: UI state repeated without progress")
+                continue
+
+            if not actions_value:
                 raise AndroidSimError(f"Planner returned no executable actions at step {step}: {plan}")
-            if not all(isinstance(action, dict) for action in actions):
-                raise AndroidSimError(f"Planner returned an invalid action batch: {actions!r}")
-            actions = _safe_batch(actions, self.config.max_actions_per_step)
+            if not all(isinstance(action, dict) for action in actions_value):
+                raise AndroidSimError(f"Planner returned an invalid action batch: {actions_value!r}")
+            actions = _safe_batch(actions_value, self.config.max_actions_per_step)
             if not actions:
                 raise AndroidSimError("Planner batch became empty after safety validation")
 
             for action in actions:
-                sensitive = _sensitive(action, observation)
-                if sensitive and not self.config.auto_approve_sensitive:
-                    raise AndroidSimError(
-                        f"Approval required before sensitive UI action {sensitive!r}. "
-                        "Re-run with --approve-sensitive if this task is intentionally authorized."
-                    )
+                self._require_sensitive_approval(action, observation)
 
             before = observation
             try:
@@ -279,17 +409,19 @@ class ComputerUseAgent:
 
             stale_replans = 0
             total_actions += len(results)
+            transition = self._transition()
             for result in results:
                 history.append({
                     "step": step,
                     "state": before.state_hash,
                     "revision": before.revision,
-                    "action": result.action,
+                    "action": _history_action(result.action),
                     "ok": result.ok,
                     "latency_ms": round(result.latency_ms, 1),
                     "detail": result.detail,
                     "next_state": observation.state_hash,
                     "next_revision": observation.revision,
+                    "transition": transition,
                 })
 
             if repeated_states >= 4:
