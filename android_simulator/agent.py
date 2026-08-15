@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from typing import Any
 
 from .computer_use import DeviceController, Observation, StaleStateError, action_schema
 from .errors import AndroidSimError
+from .perception import compact_for_task
 
 
 SENSITIVE_LABELS = {
@@ -24,10 +26,13 @@ SENSITIVE_LABELS = {
 class AgentConfig:
     endpoint: str = field(default_factory=lambda: os.environ.get("ANDROID_AGENT_ENDPOINT", "http://127.0.0.1:11434/v1/chat/completions"))
     model: str = field(default_factory=lambda: os.environ.get("ANDROID_AGENT_MODEL", ""))
+    vision_model: str = field(default_factory=lambda: os.environ.get("ANDROID_AGENT_VISION_MODEL", ""))
     api_key: str = field(default_factory=lambda: os.environ.get("ANDROID_AGENT_API_KEY", ""))
     timeout_seconds: float = 45.0
     max_steps: int = 40
     max_actions_per_step: int = 8
+    task_context_nodes: int = 72
+    full_context_nodes: int = 360
     use_vision: bool = True
     auto_approve_sensitive: bool = False
     settle_timeout_ms: int = 900
@@ -67,9 +72,10 @@ class PlannerClient:
             raise AndroidSimError("Planner response must be a JSON object")
         return value
 
-    def _post(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def _post(self, messages: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
+        selected_model = model or self.config.model
         payload = json.dumps({
-            "model": self.config.model,
+            "model": selected_model,
             "messages": messages,
             "temperature": 0,
         }).encode()
@@ -77,6 +83,7 @@ class PlannerClient:
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         request = urllib.request.Request(self.config.endpoint, data=payload, headers=headers, method="POST")
+        started = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
                 body = json.loads(response.read().decode())
@@ -88,7 +95,10 @@ class PlannerClient:
             raise AndroidSimError(f"Unexpected planner response: {body}") from exc
         if isinstance(content, list):
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return self._extract_json(str(content))
+        result = self._extract_json(str(content))
+        result["_planner_latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        result["_planner_model"] = selected_model
+        return result
 
     def plan(
         self,
@@ -96,21 +106,36 @@ class PlannerClient:
         observation: Observation,
         history: list[dict[str, Any]],
         *,
+        context_mode: str = "ranked",
         screenshot: Path | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
+        if context_mode == "ranked":
+            semantic = compact_for_task(
+                observation,
+                task,
+                max_nodes=self.config.task_context_nodes,
+            )
+        elif context_mode == "full":
+            semantic = observation.compact(max_nodes=self.config.full_context_nodes)
+            semantic["perception"] = "full_semantic"
+        else:
+            raise AndroidSimError(f"Unknown planner context mode: {context_mode}")
+
         system = (
             "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the UI tree over coordinates. "
             "Batch deterministic actions to reduce latency, but never include a second ref/selector action after a prior "
             "ref/selector action in the same batch because selectors describe one observed state. It is okay to batch "
             "non-selector follow-ups such as type, enter, wait, key, or coordinate gestures. Never invent a ref. "
-            "Password node text is deliberately redacted. If the semantic hierarchy is insufficient and pixels would help, "
-            "set need_vision=true and actions=[]. If the task is complete, set done=true. Schema: "
-            "{done:boolean, summary:string, need_vision:boolean, actions:[action...]}. Action schema: "
+            "Password node text is deliberately redacted. The first semantic view may be task-ranked and incomplete. "
+            "If more semantic nodes are needed, set need_context=true with actions=[]. If pixels are required after semantic "
+            "context is sufficient, set need_vision=true with actions=[]. If the task is complete, set done=true. Schema: "
+            "{done:boolean, summary:string, need_context:boolean, need_vision:boolean, actions:[action...]}. Action schema: "
             + json.dumps(action_schema(), separators=(",", ":"))
         )
         text = json.dumps({
             "task": task,
-            "observation": observation.compact(),
+            "observation": semantic,
             "recent_history": history[-6:],
         }, separators=(",", ":"))
         if screenshot is None:
@@ -121,10 +146,12 @@ class PlannerClient:
                 {"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
             ]
-        return self._post([
+        result = self._post([
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
-        ])
+        ], model=model)
+        result["_perception"] = "vision" if screenshot is not None else context_mode
+        return result
 
 
 def _sensitive(action: dict[str, Any], observation: Observation) -> str | None:
@@ -161,6 +188,27 @@ class ComputerUseAgent:
         self.planner = planner
         self.config = config
 
+    def _plan(self, task: str, observation: Observation, history: list[dict[str, Any]]) -> dict[str, Any]:
+        plan = self.planner.plan(task, observation, history, context_mode="ranked")
+        if plan.get("need_context"):
+            plan = self.planner.plan(task, observation, history, context_mode="full")
+        if plan.get("need_vision") or (plan.get("need_context") and self.config.use_vision):
+            if not self.config.use_vision:
+                raise AndroidSimError("Planner requested vision but vision fallback is disabled")
+            screenshot = self.controller.screenshot()
+            try:
+                plan = self.planner.plan(
+                    task,
+                    observation,
+                    history,
+                    context_mode="full",
+                    screenshot=screenshot,
+                    model=self.config.vision_model or self.config.model,
+                )
+            finally:
+                screenshot.unlink(missing_ok=True)
+        return plan
+
     def run(self, task: str) -> AgentRun:
         history: list[dict[str, Any]] = []
         total_actions = 0
@@ -176,15 +224,17 @@ class ComputerUseAgent:
                 repeated_states = 0
             last_hash = observation.state_hash
 
-            plan = self.planner.plan(task, observation, history)
-            if plan.get("need_vision"):
-                if not self.config.use_vision:
-                    raise AndroidSimError("Planner requested vision but vision fallback is disabled")
-                screenshot = self.controller.screenshot()
-                try:
-                    plan = self.planner.plan(task, observation, history, screenshot=screenshot)
-                finally:
-                    screenshot.unlink(missing_ok=True)
+            plan = self._plan(task, observation, history)
+            history.append({
+                "step": step,
+                "event": "plan",
+                "state": observation.state_hash,
+                "revision": observation.revision,
+                "perception": plan.get("_perception"),
+                "planner_model": plan.get("_planner_model"),
+                "planner_latency_ms": plan.get("_planner_latency_ms"),
+                "planned_actions": len(plan.get("actions") or []),
+            })
 
             if bool(plan.get("done")):
                 return AgentRun(task, True, str(plan.get("summary", "done")), step, total_actions, history)
