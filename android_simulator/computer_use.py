@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -137,8 +139,8 @@ class ActionResult:
 class DeviceController:
     """Low-overhead Android computer-use primitives over ADB.
 
-    The hot path is semantic hierarchy -> local selector -> ADB input. Screenshots are
-    deliberately out of the hot path and are only produced for vision fallback.
+    The hot path is semantic hierarchy -> local selector -> one device-side action transaction.
+    Screenshots are deliberately out of the hot path and only produced for vision fallback.
     """
 
     def __init__(self, toolchain: Toolchain, serial: str):
@@ -149,27 +151,29 @@ class DeviceController:
     def _shell(self, args: list[str], *, check: bool = True) -> str:
         return adb_module.shell(self.toolchain, self.serial, args, check=check, quiet=True)
 
-    def _window(self) -> tuple[str, str]:
-        raw = self._shell(["dumpsys", "window", "windows"], check=False)
-        match = re.search(r"(?:mCurrentFocus|mFocusedApp).*? ([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", raw)
-        if not match:
-            return "", ""
-        component = match.group(1)
-        package, _, activity = component.partition("/")
-        return package, activity
-
-    def _screen_size(self) -> tuple[int, int]:
-        raw = self._shell(["wm", "size"], check=False)
-        match = re.search(r"(\d+)x(\d+)", raw)
-        return (int(match.group(1)), int(match.group(2))) if match else (1080, 1920)
+    def _metadata(self) -> tuple[str, str, int, int]:
+        # One adb shell round trip for both size and focused-window metadata.
+        raw = self._shell(
+            [
+                "sh",
+                "-c",
+                "wm size; echo __ANDROID_SIM_WINDOW__; dumpsys window windows | grep -m 1 -E 'mCurrentFocus|mFocusedApp'",
+            ],
+            check=False,
+        )
+        size = re.search(r"(\d+)x(\d+)", raw)
+        width, height = (int(size.group(1)), int(size.group(2))) if size else (1080, 1920)
+        component = re.search(r"([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", raw)
+        if not component:
+            return "", "", width, height
+        package, _, activity = component.group(1).partition("/")
+        return package, activity, width, height
 
     def _hierarchy_xml(self) -> str:
-        remote = "/sdcard/.android-sim-window.xml"
-        self._shell(["uiautomator", "dump", "--compressed", remote], check=False)
-        xml = self._shell(["cat", remote], check=False)
+        # /dev/tty avoids the older dump-to-file -> cat sequence and saves an adb round trip.
+        xml = self._shell(["uiautomator", "dump", "--compressed", "/dev/tty"], check=False)
         if "<hierarchy" not in xml:
-            self._shell(["uiautomator", "dump", remote], check=False)
-            xml = self._shell(["cat", remote], check=False)
+            xml = self._shell(["uiautomator", "dump", "/dev/tty"], check=False)
         if "<hierarchy" not in xml:
             raise AndroidSimError("Could not read Android UI hierarchy")
         return xml[xml.find("<hierarchy") :]
@@ -208,9 +212,12 @@ class DeviceController:
 
     def observe(self) -> Observation:
         started = time.perf_counter()
-        xml = self._hierarchy_xml()
-        package, activity = self._window()
-        width, height = self._screen_size()
+        # UIAutomator startup dominates the structured observation path, so metadata is collected in parallel.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            xml_future = executor.submit(self._hierarchy_xml)
+            metadata_future = executor.submit(self._metadata)
+            xml = xml_future.result()
+            package, activity, width, height = metadata_future.result()
         observation = Observation(
             serial=self.serial,
             package=package,
@@ -255,8 +262,7 @@ class DeviceController:
     def _input_text(value: str) -> str:
         return value.replace("%", "%25").replace(" ", "%s")
 
-    def act(self, action: dict[str, Any], observation: Observation | None = None) -> ActionResult:
-        started = time.perf_counter()
+    def _compile_action(self, action: dict[str, Any], observation: Observation | None) -> tuple[str, str]:
         kind = str(action.get("type", ""))
         detail = ""
         obs = observation or self._last_observation
@@ -268,64 +274,93 @@ class DeviceController:
                     detail = node.label
                 else:
                     x, y = int(action["x"]), int(action["y"])
-                self._shell(["input", "tap", str(x), str(y)])
-            elif kind == "long_press":
+                return f"input tap {x} {y}", detail
+            if kind == "long_press":
                 node = self.find(str(action.get("ref") or action.get("selector")), obs)
                 x, y = node.bounds.center
-                duration = int(action.get("duration_ms", 700))
-                self._shell(["input", "swipe", str(x), str(y), str(x), str(y), str(duration)])
-            elif kind == "type":
+                duration = max(1, min(int(action.get("duration_ms", 700)), 10000))
+                return f"input swipe {x} {y} {x} {y} {duration}", node.label
+            if kind == "type":
                 value = str(action.get("text", ""))
+                encoded = shlex.quote(self._input_text(value))
+                prefix = ""
                 if action.get("clear"):
-                    self._shell(["input", "keyevent", "KEYCODE_MOVE_END"], check=False)
-                    for _ in range(min(int(action.get("clear_chars", 120)), 300)):
-                        self._shell(["input", "keyevent", "KEYCODE_DEL"], check=False)
-                self._shell(["input", "text", self._input_text(value)])
-                detail = f"{len(value)} chars"
-            elif kind == "key":
-                self._shell(["input", "keyevent", str(action["key"])])
-            elif kind == "back":
-                self._shell(["input", "keyevent", "KEYCODE_BACK"])
-            elif kind == "home":
-                self._shell(["input", "keyevent", "KEYCODE_HOME"])
-            elif kind == "enter":
-                self._shell(["input", "keyevent", "KEYCODE_ENTER"])
-            elif kind == "swipe":
-                self._shell(["input", "swipe", str(int(action["x1"])), str(int(action["y1"])), str(int(action["x2"])), str(int(action["y2"])), str(int(action.get("duration_ms", 220)))])
-            elif kind == "scroll":
-                width, height = (obs.width, obs.height) if obs else self._screen_size()
+                    chars = max(0, min(int(action.get("clear_chars", 120)), 300))
+                    prefix = (
+                        "input keyevent KEYCODE_MOVE_END; "
+                        f"i=0; while [ $i -lt {chars} ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done; "
+                    )
+                return prefix + f"input text {encoded}", f"{len(value)} chars"
+            if kind == "key":
+                return f"input keyevent {shlex.quote(str(action['key']))}", detail
+            if kind == "back":
+                return "input keyevent KEYCODE_BACK", detail
+            if kind == "home":
+                return "input keyevent KEYCODE_HOME", detail
+            if kind == "enter":
+                return "input keyevent KEYCODE_ENTER", detail
+            if kind == "swipe":
+                x1, y1 = int(action["x1"]), int(action["y1"])
+                x2, y2 = int(action["x2"]), int(action["y2"])
+                duration = max(1, min(int(action.get("duration_ms", 220)), 10000))
+                return f"input swipe {x1} {y1} {x2} {y2} {duration}", detail
+            if kind == "scroll":
+                width, height = (obs.width, obs.height) if obs else (1080, 1920)
                 direction = str(action.get("direction", "down"))
                 amount = max(0.1, min(float(action.get("amount", 0.62)), 0.8))
                 x = width // 2
                 hi, lo = int(height * 0.78), int(height * max(0.12, 0.78 - amount))
                 y1, y2 = (hi, lo) if direction == "down" else (lo, hi)
-                self._shell(["input", "swipe", str(x), str(y1), str(x), str(y2), "180"])
-            elif kind == "launch":
-                package = str(action["package"])
-                self._shell(["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"])
-            elif kind == "wait":
-                time.sleep(max(0.0, min(float(action.get("seconds", 0.5)), 10.0)))
-            else:
-                raise AndroidSimError(f"Unsupported computer-use action: {kind!r}")
+                return f"input swipe {x} {y1} {x} {y2} 180", detail
+            if kind == "launch":
+                package = shlex.quote(str(action["package"]))
+                return f"monkey -p {package} -c android.intent.category.LAUNCHER 1 >/dev/null", detail
+            if kind == "wait":
+                seconds = max(0.0, min(float(action.get("seconds", 0.5)), 10.0))
+                return f"sleep {seconds:.3f}", detail
+            raise AndroidSimError(f"Unsupported computer-use action: {kind!r}")
         except (KeyError, TypeError, ValueError) as exc:
             raise AndroidSimError(f"Malformed {kind!r} action: {action}") from exc
+
+    def act(self, action: dict[str, Any], observation: Observation | None = None) -> ActionResult:
+        started = time.perf_counter()
+        command, detail = self._compile_action(action, observation)
+        self._shell(["sh", "-c", "set -e; " + command])
         self._last_observation = None
         return ActionResult(action=action, ok=True, latency_ms=(time.perf_counter() - started) * 1000, detail=detail)
 
     def macro(self, actions: Iterable[dict[str, Any]], *, max_actions: int = 12) -> list[ActionResult]:
-        results: list[ActionResult] = []
+        batch = list(actions)
+        if len(batch) > max_actions:
+            raise AndroidSimError(f"Macro exceeds {max_actions} action limit")
+        if not batch:
+            return []
         obs = self._last_observation
-        for index, action in enumerate(actions):
-            if index >= max_actions:
-                raise AndroidSimError(f"Macro exceeds {max_actions} action limit")
-            results.append(self.act(action, obs))
-            obs = None
-        return results
+        commands: list[str] = []
+        details: list[str] = []
+        selector_seen = False
+        for action in batch:
+            uses_selector = bool(action.get("ref") or action.get("selector"))
+            if uses_selector and selector_seen:
+                raise AndroidSimError("A macro cannot reuse semantic selectors after a UI-changing selector action")
+            command, detail = self._compile_action(action, obs)
+            commands.append(command)
+            details.append(detail)
+            selector_seen = selector_seen or uses_selector
+        started = time.perf_counter()
+        self._shell(["sh", "-c", "set -e; " + "; ".join(commands)])
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        self._last_observation = None
+        per_action = elapsed_ms / len(batch)
+        return [
+            ActionResult(action=action, ok=True, latency_ms=per_action, detail=detail)
+            for action, detail in zip(batch, details)
+        ]
 
 
 def action_schema() -> dict[str, Any]:
     return {
         "types": ["tap", "long_press", "type", "key", "back", "home", "enter", "swipe", "scroll", "launch", "wait"],
         "selector": "Prefer ref from observation. text/resource-id/content-description selectors are also accepted.",
-        "batching": "Return multiple safe deterministic actions in one plan when intermediate observation is unnecessary.",
+        "batching": "Batch deterministic non-selector follow-ups; only one semantic selector action is allowed per state.",
     }
