@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .completion import completion_contract, validate_completion_evidence
 from .computer_use import DeviceController, Observation, StaleStateError, action_schema
 from .errors import AndroidSimError
 from .perception import compact_for_task
@@ -38,6 +39,8 @@ class AgentConfig:
     use_vision: bool = True
     auto_approve_sensitive: bool = False
     settle_timeout_ms: int = 900
+    require_completion_evidence: bool = True
+    max_completion_rejects: int = 4
 
 
 @dataclass
@@ -124,22 +127,27 @@ class PlannerClient:
         else:
             raise AndroidSimError(f"Unknown planner context mode: {context_mode}")
 
-        contract = program_contract(self.config.max_program_steps)
+        program = program_contract(self.config.max_program_steps)
+        completion = completion_contract()
         system = (
             "You control an Android phone. Produce ONLY JSON. Prefer semantic refs from the current UI tree over coordinates. "
             "For a one-state action batch, never include a second ref/selector action after a prior ref/selector action because "
             "those refs describe one observed state. It is okay to batch deterministic non-selector follow-ups. Never invent a ref. "
             "Password node text is deliberately redacted. The first semantic view may be task-ranked and incomplete. "
             "If more semantic nodes are needed, set need_context=true with actions=[] and program=[]. If pixels are required, "
-            "set need_vision=true with actions=[] and program=[]. If the task is complete, set done=true. "
+            "set need_vision=true with actions=[] and program=[]. "
+            "If the task is complete, set done=true AND include completion evidence grounded in the current observation. "
+            "Evidence must contain at least one current ref or exact visible label/text/id suffix; the host validates it locally. "
             "For obvious multi-screen flows, you MAY return a guarded program instead of actions. Program future-state targeted "
             "actions must use exact human-visible selector strings, never refs or coordinates. Each program step is freshly grounded "
             "against a settled state and aborts/replans on guard failure, ambiguity, stale state, failed action, or no UI change. "
             "Do not return both non-empty actions and program. Schema: "
-            "{done:boolean, summary:string, need_context:boolean, need_vision:boolean, actions:[action...], "
+            "{done:boolean, summary:string, evidence?:{package?:string,activity?:string,refs?:[string],exact?:[string]}, "
+            "need_context:boolean, need_vision:boolean, actions:[action...], "
             "program:[{when:{package?:string,activity?:string,contains?:[string],absent?:[string]},action:action}]}. "
             "Action schema: " + json.dumps(action_schema(), separators=(",", ":")) + ". Program contract: "
-            + json.dumps(contract, separators=(",", ":"))
+            + json.dumps(program, separators=(",", ":")) + ". Completion contract: "
+            + json.dumps(completion, separators=(",", ":"))
         )
         text = json.dumps({
             "task": task,
@@ -206,8 +214,10 @@ class ComputerUseAgent:
         self.config = config
 
     def _plan(self, task: str, observation: Observation, history: list[dict[str, Any]]) -> dict[str, Any]:
-        plan = self.planner.plan(task, observation, history, context_mode="ranked")
-        if plan.get("need_context"):
+        force_full = bool(history and history[-1].get("event") == "completion_rejected")
+        initial_mode = "full" if force_full else "ranked"
+        plan = self.planner.plan(task, observation, history, context_mode=initial_mode)
+        if initial_mode == "ranked" and plan.get("need_context"):
             plan = self.planner.plan(task, observation, history, context_mode="full")
         if plan.get("need_vision") or (plan.get("need_context") and self.config.use_vision):
             if not self.config.use_vision:
@@ -336,6 +346,7 @@ class ComputerUseAgent:
         last_hash = ""
         repeated_states = 0
         stale_replans = 0
+        completion_rejects = 0
         observation = self.controller.observe()
 
         for step in range(1, self.config.max_steps + 1):
@@ -361,6 +372,28 @@ class ComputerUseAgent:
             })
 
             if bool(plan.get("done")):
+                if self.config.require_completion_evidence:
+                    valid, checks, reason = validate_completion_evidence(plan.get("evidence"), observation)
+                    if not valid:
+                        completion_rejects += 1
+                        history.append({
+                            "step": step,
+                            "event": "completion_rejected",
+                            "state": observation.state_hash,
+                            "revision": observation.revision,
+                            "reason": reason,
+                            "checks": checks,
+                        })
+                        if completion_rejects > self.config.max_completion_rejects:
+                            raise AndroidSimError("Planner repeatedly claimed completion without valid current-state evidence")
+                        continue
+                    history.append({
+                        "step": step,
+                        "event": "completion_accepted",
+                        "state": observation.state_hash,
+                        "revision": observation.revision,
+                        "checks": checks,
+                    })
                 return AgentRun(task, True, str(plan.get("summary", "done")), step, total_actions, history)
 
             if not isinstance(actions_value, list) or not isinstance(program_value, list):
@@ -408,6 +441,7 @@ class ComputerUseAgent:
                 continue
 
             stale_replans = 0
+            completion_rejects = 0
             total_actions += len(results)
             transition = self._transition()
             for result in results:
