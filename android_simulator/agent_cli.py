@@ -19,6 +19,35 @@ from .bridge import (
 from .computer_use import action_schema
 from .config import discover_toolchain
 from .errors import AndroidSimError
+from .evals import builtin_cases, dumps_eval_report, run_eval_suite
+
+
+def _add_agent_tuning(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-steps", type=int, default=40)
+    parser.add_argument("--max-actions-per-step", type=int, default=8)
+    parser.add_argument("--max-program-steps", type=int, default=6)
+    parser.add_argument("--task-context-nodes", type=int, default=72)
+    parser.add_argument("--full-context-nodes", type=int, default=360)
+    parser.add_argument("--settle-timeout-ms", type=int, default=900)
+    parser.add_argument("--no-vision", action="store_true")
+    parser.add_argument("--approve-sensitive", action="store_true")
+
+
+def _agent_config(args: argparse.Namespace) -> AgentConfig:
+    return AgentConfig(
+        endpoint=args.endpoint,
+        model=args.model,
+        vision_model=args.vision_model,
+        api_key=args.api_key,
+        max_steps=max(1, min(args.max_steps, 200)),
+        max_actions_per_step=max(1, min(args.max_actions_per_step, 12)),
+        max_program_steps=max(0, min(args.max_program_steps, 12)),
+        task_context_nodes=max(16, min(args.task_context_nodes, 240)),
+        full_context_nodes=max(64, min(args.full_context_nodes, 600)),
+        use_vision=not args.no_vision,
+        auto_approve_sensitive=args.approve_sensitive,
+        settle_timeout_ms=max(0, min(args.settle_timeout_ms, 5000)),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,14 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run an autonomous task")
     run.add_argument("task")
-    run.add_argument("--max-steps", type=int, default=40)
-    run.add_argument("--max-actions-per-step", type=int, default=8)
-    run.add_argument("--task-context-nodes", type=int, default=72)
-    run.add_argument("--full-context-nodes", type=int, default=360)
-    run.add_argument("--settle-timeout-ms", type=int, default=900)
-    run.add_argument("--no-vision", action="store_true")
-    run.add_argument("--approve-sensitive", action="store_true")
+    _add_agent_tuning(run)
     run.add_argument("--json", action="store_true")
+
+    eval_parser = sub.add_parser("eval", help="Run deterministic Android end-state evaluations")
+    _add_agent_tuning(eval_parser)
+    eval_parser.add_argument("--synthetic-only", action="store_true", help="Skip Android Settings transfer cases")
+    eval_parser.add_argument("--case", action="append", default=[], help="Run one or more exact built-in case IDs")
+    eval_parser.add_argument("--output", type=Path, help="Write the full JSON report to a file")
 
     bench = sub.add_parser("bench", help="Measure observation, action, and fused act-observe latency")
     bench.add_argument("--iterations", type=int, default=20)
@@ -113,19 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             from .mcp_server import serve
             return serve(controller)
         if args.command == "run":
-            config = AgentConfig(
-                endpoint=args.endpoint,
-                model=args.model,
-                vision_model=args.vision_model,
-                api_key=args.api_key,
-                max_steps=args.max_steps,
-                max_actions_per_step=args.max_actions_per_step,
-                task_context_nodes=max(16, min(args.task_context_nodes, 240)),
-                full_context_nodes=max(64, min(args.full_context_nodes, 600)),
-                use_vision=not args.no_vision,
-                auto_approve_sensitive=args.approve_sensitive,
-                settle_timeout_ms=max(0, min(args.settle_timeout_ms, 5000)),
-            )
+            config = _agent_config(args)
             result = ComputerUseAgent(controller, PlannerClient(config), config).run(args.task)
             payload = {
                 "task": result.task,
@@ -144,8 +161,32 @@ def main(argv: list[str] | None = None) -> int:
                     f"transport={controller.transport_name} summary={result.summary}"
                 )
             return 0 if result.done else 1
+        if args.command == "eval":
+            config = _agent_config(args)
+            available = builtin_cases(include_settings=not args.synthetic_only)
+            if args.case:
+                requested = set(args.case)
+                known = {case.id for case in available}
+                missing = sorted(requested - known)
+                if missing:
+                    raise AndroidSimError(f"Unknown eval case(s): {', '.join(missing)}")
+                selected = tuple(case for case in available if case.id in requested)
+            else:
+                selected = available
+            report = run_eval_suite(
+                controller,
+                PlannerClient(config),
+                config,
+                cases=selected,
+                include_settings=not args.synthetic_only,
+            )
+            body = dumps_eval_report(report)
+            if args.output:
+                args.output.expanduser().resolve().write_text(body + "\n", encoding="utf-8")
+            print(body)
+            return 0 if report["result"]["aggregate"]["successes"] == report["result"]["aggregate"]["cases"] else 1
         raise AndroidSimError(f"Unhandled command: {args.command}")
-    except (AndroidSimError, json.JSONDecodeError) as exc:
+    except (AndroidSimError, json.JSONDecodeError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     finally:
