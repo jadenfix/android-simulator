@@ -4,7 +4,7 @@ import json
 import sys
 from typing import Any
 
-from .computer_use import DeviceController
+from .computer_use import DeviceController, StaleStateError
 from .errors import AndroidSimError
 
 
@@ -20,7 +20,7 @@ TOOLS = [
     },
     {
         "name": "android_act",
-        "description": "Execute one Android computer-use action (tap/type/key/back/home/swipe/scroll/launch/wait).",
+        "description": "Execute one Android computer-use action and return its verified next state.",
         "inputSchema": {
             "type": "object",
             "required": ["action"],
@@ -30,12 +30,27 @@ TOOLS = [
     },
     {
         "name": "android_macro",
-        "description": "Execute a bounded batch of deterministic Android actions to reduce agent round trips.",
+        "description": "Execute a bounded deterministic Android action batch without an extra observation payload.",
         "inputSchema": {
             "type": "object",
             "required": ["actions"],
             "properties": {
                 "actions": {"type": "array", "items": {"type": "object"}, "maxItems": 12}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "android_act_observe",
+        "description": "Execute a bounded action batch only against the expected UI state, wait for Android change events, and return action receipts plus the next semantic state in one call.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["actions"],
+            "properties": {
+                "actions": {"type": "array", "items": {"type": "object"}, "maxItems": 12},
+                "expectedRevision": {"type": "integer", "minimum": 0},
+                "expectedStateHash": {"type": "string"},
+                "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 900}
             },
             "additionalProperties": False,
         },
@@ -58,6 +73,47 @@ def _tool_content(value: Any) -> dict[str, Any]:
     }
 
 
+def _state_mismatch(observation, arguments: dict[str, Any]) -> bool:
+    expected_revision = int(arguments.get("expectedRevision") or 0)
+    expected_hash = str(arguments.get("expectedStateHash") or "")
+    if expected_revision and observation.revision and expected_revision != observation.revision:
+        return True
+    return bool(expected_hash and expected_hash != observation.state_hash)
+
+
+def _fused(controller: DeviceController, arguments: dict[str, Any]) -> dict[str, Any]:
+    actions = arguments.get("actions")
+    if not isinstance(actions, list):
+        raise AndroidSimError("android_act_observe requires an actions array")
+    observation = controller.observe()
+    if _state_mismatch(observation, arguments):
+        return {
+            "stale": True,
+            "transport": controller.transport_name,
+            "observation": observation.compact(),
+            "results": [],
+        }
+    try:
+        results, next_observation = controller.act_and_observe(
+            actions,
+            observation,
+            timeout_ms=int(arguments.get("timeoutMs") or 900),
+        )
+    except StaleStateError as exc:
+        return {
+            "stale": True,
+            "transport": controller.transport_name,
+            "observation": exc.observation.compact(),
+            "results": [],
+        }
+    return {
+        "stale": False,
+        "transport": controller.transport_name,
+        "results": [result.__dict__ for result in results],
+        "observation": next_observation.compact(),
+    }
+
+
 def _handle(controller: DeviceController, request: dict[str, Any]) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
@@ -69,7 +125,7 @@ def _handle(controller: DeviceController, request: dict[str, Any]) -> dict[str, 
         return _ok(request_id, {
             "protocolVersion": requested,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "jadenfix-android-computer-use", "version": "0.2.0"},
+            "serverInfo": {"name": "jadenfix-android-computer-use", "version": "0.3.0"},
         })
     if method == "ping":
         return _ok(request_id, {})
@@ -80,28 +136,31 @@ def _handle(controller: DeviceController, request: dict[str, Any]) -> dict[str, 
         arguments = params.get("arguments") or {}
         if name == "android_observe":
             obs = controller.observe()
-            return _ok(request_id, _tool_content(obs.compact(max_nodes=500 if arguments.get("full") else 180)))
+            value = obs.compact(max_nodes=500 if arguments.get("full") else 180)
+            value["transport"] = controller.transport_name
+            return _ok(request_id, _tool_content(value))
         if name == "android_act":
             action = arguments.get("action")
             if not isinstance(action, dict):
                 raise AndroidSimError("android_act requires an action object")
-            result = controller.act(action, controller.observe())
-            return _ok(request_id, _tool_content(result.__dict__))
+            return _ok(request_id, _tool_content(_fused(controller, {"actions": [action]})))
         if name == "android_macro":
             actions = arguments.get("actions")
             if not isinstance(actions, list):
                 raise AndroidSimError("android_macro requires an actions array")
             results = controller.macro(actions)
             return _ok(request_id, _tool_content([result.__dict__ for result in results]))
+        if name == "android_act_observe":
+            return _ok(request_id, _tool_content(_fused(controller, arguments)))
         return _error(request_id, -32602, f"Unknown tool: {name}")
     return _error(request_id, -32601, f"Method not found: {method}")
 
 
 def serve(controller: DeviceController) -> int:
-    """Minimal MCP stdio provider intentionally kept dependency-free.
+    """Dependency-free MCP stdio provider.
 
-    It uses newline-delimited JSON-RPC messages, which makes it easy to front with tempera-mcp
-    for admission, policy, receipts, routing, and higher-performance production transports.
+    tempera-mcp can front this process for admission, policy, receipts, routing, and transport.
+    The Android provider owns only semantic state and execution, keeping platform concerns separated.
     """
     for line in sys.stdin:
         line = line.strip()
