@@ -103,7 +103,8 @@ PYTHON_BIN="$(command -v python3)"
 if ! /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
   brew install --cask temurin@21
 fi
-export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+export JAVA_HOME
 
 if ! brew list --cask android-commandlinetools >/dev/null 2>&1; then
   brew install --cask android-commandlinetools
