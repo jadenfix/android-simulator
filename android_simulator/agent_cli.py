@@ -20,6 +20,7 @@ from .computer_use import action_schema
 from .config import discover_toolchain
 from .errors import AndroidSimError
 from .evals import builtin_cases, dumps_eval_report, run_eval_suite
+from .tempera_evals import external_adapter_result
 
 
 def _add_agent_tuning(parser: argparse.ArgumentParser) -> None:
@@ -31,6 +32,8 @@ def _add_agent_tuning(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--settle-timeout-ms", type=int, default=900)
     parser.add_argument("--no-vision", action="store_true")
     parser.add_argument("--approve-sensitive", action="store_true")
+    parser.add_argument("--skills", action="store_true", help="Enable opt-in persistent navigation-skill replay")
+    parser.add_argument("--skill-cache", type=Path, help="Override the private local navigation-skill cache path")
 
 
 def _agent_config(args: argparse.Namespace) -> AgentConfig:
@@ -47,7 +50,15 @@ def _agent_config(args: argparse.Namespace) -> AgentConfig:
         use_vision=not args.no_vision,
         auto_approve_sensitive=args.approve_sensitive,
         settle_timeout_ms=max(0, min(args.settle_timeout_ms, 5000)),
+        use_skill_cache=bool(args.skills),
+        skill_cache_path=str(args.skill_cache.expanduser()) if args.skill_cache else "",
     )
+
+
+def _write(path: Path, body: str) -> None:
+    resolved = path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(body + "\n", encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,7 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_agent_tuning(eval_parser)
     eval_parser.add_argument("--synthetic-only", action="store_true", help="Skip Android Settings transfer cases")
     eval_parser.add_argument("--case", action="append", default=[], help="Run one or more exact built-in case IDs")
-    eval_parser.add_argument("--output", type=Path, help="Write the full JSON report to a file")
+    eval_parser.add_argument("--output", type=Path, help="Write the full local JSON report to a file")
+    eval_parser.add_argument("--tempera-output", type=Path, help="Also write a pinned Tempera Evals external result")
+    eval_parser.add_argument("--tempera-run-id", help="Tempera Evals run ID for governed export")
+    eval_parser.add_argument("--tempera-plan-sha256", help="Real pinned Tempera eval-run-plan digest")
+    eval_parser.add_argument("--tempera-adapter-sha256", help="Real pinned external adapter descriptor digest")
 
     bench = sub.add_parser("bench", help="Measure observation, action, and fused act-observe latency")
     bench.add_argument("--iterations", type=int, default=20)
@@ -182,7 +197,28 @@ def main(argv: list[str] | None = None) -> int:
             )
             body = dumps_eval_report(report)
             if args.output:
-                args.output.expanduser().resolve().write_text(body + "\n", encoding="utf-8")
+                _write(args.output, body)
+
+            tempera_values = (
+                args.tempera_output,
+                args.tempera_run_id,
+                args.tempera_plan_sha256,
+                args.tempera_adapter_sha256,
+            )
+            if any(value is not None for value in tempera_values):
+                if not all(value is not None for value in tempera_values):
+                    raise AndroidSimError(
+                        "Tempera export requires --tempera-output, --tempera-run-id, "
+                        "--tempera-plan-sha256, and --tempera-adapter-sha256 together"
+                    )
+                normalized = external_adapter_result(
+                    report,
+                    run_id=args.tempera_run_id,
+                    plan_sha256=args.tempera_plan_sha256,
+                    adapter_descriptor_sha256=args.tempera_adapter_sha256,
+                )
+                _write(args.tempera_output, json.dumps(normalized, indent=2, sort_keys=True))
+
             print(body)
             return 0 if report["result"]["aggregate"]["successes"] == report["result"]["aggregate"]["cases"] else 1
         raise AndroidSimError(f"Unhandled command: {args.command}")
