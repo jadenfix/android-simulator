@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.jadenfix.androidbridge">
 
-    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="37" />
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
