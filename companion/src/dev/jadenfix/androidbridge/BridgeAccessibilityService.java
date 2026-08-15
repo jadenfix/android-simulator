@@ -296,21 +296,9 @@ public final class BridgeAccessibilityService extends AccessibilityService {
     private String setText(JSONObject action) throws Exception {
         String value = action.optString("text", "");
         String ref = action.optString("ref", "");
-        AccessibilityNodeInfo node;
-        if (!ref.isEmpty()) {
-            node = callOnMain(() -> NodeCodec.findByRef(this, ref));
-        } else {
-            node = callOnMain(() -> {
-                AccessibilityNodeInfo root = getRootInActiveWindow();
-                if (root == null) return null;
-                try {
-                    AccessibilityNodeInfo focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-                    return focused;
-                } finally {
-                    root.recycle();
-                }
-            });
-        }
+        AccessibilityNodeInfo node = !ref.isEmpty()
+                ? callOnMain(() -> NodeCodec.findByRef(this, ref))
+                : callOnMain(this::focusedInputNode);
         if (node == null) throw new IllegalArgumentException("no editable input target");
         try {
             if (node.isPassword() && action.optBoolean("read_modify_write", false)) {
@@ -328,20 +316,9 @@ public final class BridgeAccessibilityService extends AccessibilityService {
 
     private String imeEnter(JSONObject action) throws Exception {
         String ref = action.optString("ref", "");
-        AccessibilityNodeInfo node;
-        if (!ref.isEmpty()) {
-            node = callOnMain(() -> NodeCodec.findByRef(this, ref));
-        } else {
-            node = callOnMain(() -> {
-                AccessibilityNodeInfo root = getRootInActiveWindow();
-                if (root == null) return null;
-                try {
-                    return root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-                } finally {
-                    root.recycle();
-                }
-            });
-        }
+        AccessibilityNodeInfo node = !ref.isEmpty()
+                ? callOnMain(() -> NodeCodec.findByRef(this, ref))
+                : callOnMain(this::focusedInputNode);
         if (node == null) throw new IllegalArgumentException("no focused editable node for IME enter");
         try {
             int enterId = AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId();
@@ -351,6 +328,18 @@ public final class BridgeAccessibilityService extends AccessibilityService {
         } finally {
             node.recycle();
         }
+    }
+
+    private AccessibilityNodeInfo focusedInputNode() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return null;
+        AccessibilityNodeInfo focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+        if (focused == null) {
+            root.recycle();
+            return null;
+        }
+        if (focused != root) root.recycle();
+        return focused;
     }
 
     private String scroll(JSONObject action) throws Exception {
