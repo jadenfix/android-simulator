@@ -2,13 +2,17 @@ package dev.jadenfix.androidbridge;
 
 import android.graphics.Rect;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.util.List;
+
 final class NodeCodec {
     static final int MAX_NODES = 600;
+    static final int MAX_WINDOWS = 16;
 
     private NodeCodec() {}
 
@@ -20,21 +24,81 @@ final class NodeCodec {
         out.put("screen", new JSONArray().put(service.screenWidth()).put(service.screenHeight()));
 
         JSONArray nodes = new JSONArray();
-        AccessibilityNodeInfo root = service.getRootInActiveWindow();
-        if (root != null) {
-            int[] count = new int[]{0};
-            append(root, "0", 0, nodes, count);
+        JSONArray windowsJson = new JSONArray();
+        int[] count = new int[]{0};
+        List<AccessibilityWindowInfo> windows = service.getWindows();
+        if (windows != null && !windows.isEmpty()) {
+            int limit = Math.min(windows.size(), MAX_WINDOWS);
+            for (int index = 0; index < limit && count[0] < MAX_NODES; index++) {
+                AccessibilityWindowInfo window = windows.get(index);
+                if (window == null) continue;
+                AccessibilityNodeInfo root = null;
+                try {
+                    windowsJson.put(windowJson(window));
+                    root = window.getRoot();
+                    if (root != null) {
+                        append(root, "w" + window.getId() + ":0", 0, nodes, count);
+                    }
+                } finally {
+                    if (root != null) root.recycle();
+                    window.recycle();
+                }
+            }
+        } else {
+            AccessibilityNodeInfo root = service.getRootInActiveWindow();
+            if (root != null) {
+                try {
+                    append(root, "0", 0, nodes, count);
+                } finally {
+                    root.recycle();
+                }
+            }
         }
+        out.put("windows", windowsJson);
         out.put("nodes", nodes);
+        out.put("truncated", count[0] >= MAX_NODES);
         return out;
     }
 
     static AccessibilityNodeInfo findByRef(BridgeAccessibilityService service, String ref) {
-        AccessibilityNodeInfo root = service.getRootInActiveWindow();
-        if (root == null) {
+        List<AccessibilityWindowInfo> windows = service.getWindows();
+        if (windows != null && !windows.isEmpty()) {
+            int limit = Math.min(windows.size(), MAX_WINDOWS);
+            for (int index = 0; index < limit; index++) {
+                AccessibilityWindowInfo window = windows.get(index);
+                if (window == null) continue;
+                AccessibilityNodeInfo root = null;
+                try {
+                    root = window.getRoot();
+                    if (root == null) continue;
+                    AccessibilityNodeInfo found = find(root, "w" + window.getId() + ":0", ref);
+                    if (found != null) {
+                        if (found != root) root.recycle();
+                        return found;
+                    }
+                } finally {
+                    if (root != null && !stableRef(root, "w" + window.getId() + ":0").equals(ref)) {
+                        // The root is recycled above when a descendant is returned, or here when no match exists.
+                        try {
+                            root.recycle();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    window.recycle();
+                }
+            }
             return null;
         }
-        return find(root, "0", ref);
+
+        AccessibilityNodeInfo root = service.getRootInActiveWindow();
+        if (root == null) return null;
+        AccessibilityNodeInfo found = find(root, "0", ref);
+        if (found == null) {
+            root.recycle();
+        } else if (found != root) {
+            root.recycle();
+        }
+        return found;
     }
 
     private static AccessibilityNodeInfo find(AccessibilityNodeInfo node, String path, String wanted) {
@@ -44,14 +108,10 @@ final class NodeCodec {
         int children = node.getChildCount();
         for (int index = 0; index < children; index++) {
             AccessibilityNodeInfo child = node.getChild(index);
-            if (child == null) {
-                continue;
-            }
+            if (child == null) continue;
             AccessibilityNodeInfo found = find(child, path + "/" + index, wanted);
             if (found != null) {
-                if (found != child) {
-                    child.recycle();
-                }
+                if (found != child) child.recycle();
                 return found;
             }
             child.recycle();
@@ -66,32 +126,24 @@ final class NodeCodec {
             JSONArray output,
             int[] count
     ) throws JSONException {
-        if (count[0] >= MAX_NODES) {
-            return;
-        }
+        if (count[0] >= MAX_NODES) return;
         Rect bounds = new Rect();
         node.getBoundsInScreen(bounds);
         if (!bounds.isEmpty()) {
             output.put(toJson(node, path, depth, bounds));
             count[0] += 1;
         }
-        if (count[0] >= MAX_NODES) {
-            return;
-        }
+        if (count[0] >= MAX_NODES) return;
         int children = node.getChildCount();
         for (int index = 0; index < children; index++) {
             AccessibilityNodeInfo child = node.getChild(index);
-            if (child == null) {
-                continue;
-            }
+            if (child == null) continue;
             try {
                 append(child, path + "/" + index, depth + 1, output, count);
             } finally {
                 child.recycle();
             }
-            if (count[0] >= MAX_NODES) {
-                break;
-            }
+            if (count[0] >= MAX_NODES) break;
         }
     }
 
@@ -114,11 +166,10 @@ final class NodeCodec {
         out.put("ref", stableRef(node, path));
         out.put("label", label);
         out.put("class", shortClass(className));
+        out.put("window_id", node.getWindowId());
         out.put("bounds", new JSONArray()
                 .put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom));
         out.put("depth", depth);
-        // Preserve visible text even when it is also the preferred label. The host data model
-        // derives labels from text/description/resource-id, so dropping equal text loses fidelity.
         if (!text.isEmpty()) out.put("text", text);
         if (!description.isEmpty() && !description.equals(label)) out.put("desc", description);
         if (!hint.isEmpty() && !hint.equals(label)) out.put("hint", hint);
@@ -148,6 +199,21 @@ final class NodeCodec {
         return "b" + Long.toUnsignedString(fnv1a64(identity), 36);
     }
 
+    private static JSONObject windowJson(AccessibilityWindowInfo window) throws JSONException {
+        JSONObject out = new JSONObject();
+        out.put("id", window.getId());
+        out.put("type", window.getType());
+        out.put("layer", window.getLayer());
+        out.put("active", window.isActive());
+        out.put("focused", window.isFocused());
+        CharSequence title = window.getTitle();
+        if (title != null && title.length() > 0) out.put("title", title.toString());
+        Rect bounds = new Rect();
+        window.getBoundsInScreen(bounds);
+        out.put("bounds", new JSONArray().put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom));
+        return out;
+    }
+
     private static long fnv1a64(String value) {
         long hash = 0xcbf29ce484222325L;
         byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -168,9 +234,7 @@ final class NodeCodec {
 
     private static String firstNonEmpty(String... values) {
         for (String value : values) {
-            if (value != null && !value.isEmpty()) {
-                return value;
-            }
+            if (value != null && !value.isEmpty()) return value;
         }
         return "";
     }
