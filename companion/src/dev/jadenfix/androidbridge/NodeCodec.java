@@ -7,9 +7,6 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
-import java.util.List;
-
 final class NodeCodec {
     static final int MAX_NODES = 600;
 
@@ -120,7 +117,9 @@ final class NodeCodec {
         out.put("bounds", new JSONArray()
                 .put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom));
         out.put("depth", depth);
-        if (!text.isEmpty() && !text.equals(label)) out.put("text", text);
+        // Preserve visible text even when it is also the preferred label. The host data model
+        // derives labels from text/description/resource-id, so dropping equal text loses fidelity.
+        if (!text.isEmpty()) out.put("text", text);
         if (!description.isEmpty() && !description.equals(label)) out.put("desc", description);
         if (!hint.isEmpty() && !hint.equals(label)) out.put("hint", hint);
         if (!viewId.isEmpty()) out.put("id", viewId);
