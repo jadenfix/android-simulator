@@ -12,6 +12,13 @@
       "repository": "tempera-dev/tempera-mcp",
       "commit": "ac28724d8c8e2a7ee6e3426a8d7c43e4f4a3263c",
       "usage": "Production front door for the dependency-free Android MCP stdio provider; no runtime code is vendored"
+    },
+    {
+      "repository": "tempera-dev/tempera-evals",
+      "commit": "20ed197eda9d9683837d980745ba81cdd793891d",
+      "path": "schemas/external-adapter-result-v1.schema.json",
+      "blob_sha": "6921359697d18e92bc866fd1ca6f97f38b857ecb",
+      "usage": "Optional governed export target for deterministic Android eval results; local reports do not claim official eligibility"
     }
   ]
 }
