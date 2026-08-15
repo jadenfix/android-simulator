@@ -28,6 +28,7 @@ from .util import atomic_write, run
 PACKAGE = "dev.jadenfix.androidbridge"
 SERVICE = f"{PACKAGE}/.BridgeAccessibilityService"
 DEVICE_PORT = 6210
+PROTOCOL_VERSION = 2
 TOKEN_DIR = Path.home() / ".android-sim" / "bridge"
 
 
@@ -188,7 +189,9 @@ def setup_bridge(toolchain: Toolchain, serial: str, *, apk: Path | None = None) 
         "apk": str(output),
         "service": SERVICE,
         "protocol": health.get("protocol"),
+        "server_epoch": health.get("server_epoch"),
         "revision": health.get("revision"),
+        "capabilities": health.get("capabilities", []),
     }
 
 
@@ -215,6 +218,13 @@ def bridge_status(toolchain: Toolchain, serial: str) -> dict[str, Any]:
 
 
 class BridgeClient:
+    """Persistent bridge client with retry-safe request identity.
+
+    Action requests may be retried after a transport failure because protocol v2 carries a
+    per-client request ID and server epoch; the bridge caches completed responses and refuses
+    requests from a different service epoch instead of risking duplicate side effects.
+    """
+
     def __init__(
         self,
         toolchain: Toolchain,
@@ -228,10 +238,12 @@ class BridgeClient:
         self.token = token or _host_token(serial, create=False)
         self.connect_timeout = connect_timeout
         self.host_port = self._allocate_port()
+        self.client_id = secrets.token_hex(16)
+        self.server_epoch: str | None = None
         self._socket: socket.socket | None = None
         self._reader = None
         self._writer = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._request_id = 0
         self._configure_forward()
         self._connect()
@@ -257,7 +269,8 @@ class BridgeClient:
             try:
                 sock = socket.create_connection(("127.0.0.1", self.host_port), timeout=0.75)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.settimeout(8.0)
+                # wait_observe may legally wait 15s plus a bounded quiescence window.
+                sock.settimeout(25.0)
                 self._socket = sock
                 self._reader = sock.makefile("r", encoding="utf-8", newline="\n")
                 self._writer = sock.makefile("w", encoding="utf-8", newline="\n")
@@ -267,7 +280,7 @@ class BridgeClient:
                 time.sleep(0.1)
         raise AndroidSimError(f"Android native bridge did not become reachable: {last}")
 
-    def close(self) -> None:
+    def _drop_socket(self) -> None:
         for stream in (self._reader, self._writer):
             if stream is not None:
                 try:
@@ -282,6 +295,9 @@ class BridgeClient:
         self._reader = None
         self._writer = None
         self._socket = None
+
+    def close(self) -> None:
+        self._drop_socket()
         adb_module.adb(
             self.toolchain,
             self.serial,
@@ -290,32 +306,78 @@ class BridgeClient:
             quiet=True,
         )
 
+    def _ensure_connection(self) -> None:
+        if self._reader is not None and self._writer is not None:
+            return
+        try:
+            self._connect()
+        except AndroidSimError:
+            # Recreate the ADB forwarding rule only when the existing mapping no longer works.
+            self._configure_forward()
+            self._connect()
+
+    def _wire(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_connection()
+        assert self._reader is not None and self._writer is not None
+        self._writer.write(json.dumps(request, separators=(",", ":")) + "\n")
+        self._writer.flush()
+        line = self._reader.readline()
+        if not line:
+            raise OSError("Android bridge closed the connection")
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise OSError("Android bridge returned invalid JSON") from exc
+        if response.get("id") not in (None, request["id"]):
+            raise OSError("Android bridge response ID mismatch")
+        return response
+
     def _request(self, op: str, **payload: Any) -> dict[str, Any]:
         with self._lock:
-            if self._reader is None or self._writer is None:
-                self._configure_forward()
-                self._connect()
+            if op != "health" and not self.server_epoch:
+                self.health()
             self._request_id += 1
-            request = {"id": self._request_id, "token": self.token, "op": op, **payload}
-            try:
-                self._writer.write(json.dumps(request, separators=(",", ":")) + "\n")
-                self._writer.flush()
-                line = self._reader.readline()
-            except (OSError, ValueError) as exc:
-                raise AndroidSimError(f"Android bridge I/O failed: {exc}") from exc
-            if not line:
-                raise AndroidSimError("Android bridge closed the connection")
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise AndroidSimError("Android bridge returned invalid JSON") from exc
-            if response.get("id") not in (None, self._request_id):
-                raise AndroidSimError("Android bridge response ID mismatch")
+            request_id = self._request_id
+            request: dict[str, Any] = {
+                "id": request_id,
+                "client_id": self.client_id,
+                "token": self.token,
+                "op": op,
+                **payload,
+            }
+            if op != "health":
+                request["server_epoch"] = self.server_epoch
+
+            response: dict[str, Any] | None = None
+            last_transport_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    response = self._wire(request)
+                    break
+                except (OSError, ValueError) as exc:
+                    last_transport_error = exc
+                    self._drop_socket()
+                    if attempt == 0:
+                        continue
+            if response is None:
+                raise AndroidSimError(f"Android bridge I/O failed after retry: {last_transport_error}")
+
             if not response.get("ok"):
-                raise AndroidSimError(f"Android bridge error: {response.get('error', 'unknown error')}")
+                message = str(response.get("error", "unknown error"))
+                if "server epoch mismatch" in message:
+                    raise AndroidSimError(
+                        "Android bridge restarted during a request; action replay was refused to preserve at-most-once execution. "
+                        "Refresh observation before continuing."
+                    )
+                raise AndroidSimError(f"Android bridge error: {message}")
             result = response.get("result")
             if not isinstance(result, dict):
                 raise AndroidSimError("Android bridge response missing result object")
+            if op == "health":
+                epoch = result.get("server_epoch")
+                if not isinstance(epoch, str) or not epoch:
+                    raise AndroidSimError("Android bridge health response missing server epoch")
+                self.server_epoch = epoch
             return result
 
     def health(self) -> dict[str, Any]:
@@ -333,16 +395,33 @@ class BridgeClient:
         *,
         expected_revision: int = 0,
         timeout_ms: int = 900,
+        quiet_ms: int = 120,
+        max_settle_ms: int = 900,
     ) -> dict[str, Any]:
         return self._request(
             "act_observe",
             actions=actions,
             expected_revision=expected_revision,
             timeout_ms=timeout_ms,
+            quiet_ms=quiet_ms,
+            max_settle_ms=max_settle_ms,
         )
 
-    def wait_observe(self, *, after_revision: int, timeout_ms: int = 2000) -> dict[str, Any]:
-        return self._request("wait_observe", after_revision=after_revision, timeout_ms=timeout_ms)
+    def wait_observe(
+        self,
+        *,
+        after_revision: int,
+        timeout_ms: int = 2000,
+        quiet_ms: int = 120,
+        max_settle_ms: int = 900,
+    ) -> dict[str, Any]:
+        return self._request(
+            "wait_observe",
+            after_revision=after_revision,
+            timeout_ms=timeout_ms,
+            quiet_ms=quiet_ms,
+            max_settle_ms=max_settle_ms,
+        )
 
     def screenshot(self) -> bytes:
         result = self._request("screenshot")
@@ -358,6 +437,7 @@ class BridgeController(DeviceController):
     def __init__(self, toolchain: Toolchain, serial: str, client: BridgeClient):
         super().__init__(toolchain, serial)
         self.client = client
+        self.last_transition: dict[str, Any] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -439,7 +519,7 @@ class BridgeController(DeviceController):
             action=action,
             ok=bool(raw.get("ok", True)),
             latency_ms=float(raw.get("latency_ms", 0.0)),
-            detail=str(raw.get("detail", "")),
+            detail=str(raw.get("detail") or raw.get("error") or ""),
         )
 
     def act(self, action: dict[str, Any], observation: Observation | None = None) -> ActionResult:
@@ -465,7 +545,7 @@ class BridgeController(DeviceController):
             return []
         obs = self._last_observation or self.observe()
         if any(action.get("type") == "key" for action in batch):
-            return [self.act(action, obs) for action in batch]
+            return DeviceController.macro(self, batch, max_actions=max_actions)
         normalized = [self._native_action(action, obs) for action in batch]
         payload = self.client.act(normalized, expected_revision=obs.revision)
         if payload.get("stale"):
@@ -484,16 +564,23 @@ class BridgeController(DeviceController):
     ) -> tuple[list[ActionResult], Observation]:
         batch = list(actions)
         if not batch:
+            self.last_transition = {
+                "changed": False,
+                "settled": True,
+                "events": 0,
+                "revision": observation.revision,
+            }
             return [], observation
+
         if any(action.get("type") == "key" for action in batch):
-            results: list[ActionResult] = []
-            for action in batch:
-                if action.get("type") == "key":
-                    results.append(DeviceController.act(self, action, observation))
-                else:
-                    results.append(self.act(action, observation))
+            self._last_observation = observation
+            started = time.perf_counter()
+            results = DeviceController.macro(self, batch, max_actions=12)
             payload = self.client.wait_observe(after_revision=observation.revision, timeout_ms=timeout_ms)
-            return results, self._observation(payload["observation"], 0.0)
+            elapsed = (time.perf_counter() - started) * 1000
+            self.last_transition = dict(payload.get("transition") or {})
+            return results, self._observation(payload["observation"], elapsed)
+
         normalized = [self._native_action(action, observation) for action in batch]
         started = time.perf_counter()
         payload = self.client.act_observe(
@@ -507,6 +594,10 @@ class BridgeController(DeviceController):
             raise StaleStateError(fresh)
         rows = payload.get("results") or []
         results = [self._result(row, action) for row, action in zip(rows, batch)]
+        self.last_transition = dict(payload.get("transition") or {
+            "changed": bool(payload.get("changed", False)),
+            "settled": bool(payload.get("settled", True)),
+        })
         next_observation = self._observation(payload["observation"], latency_ms)
         return results, next_observation
 
@@ -519,7 +610,7 @@ def make_controller(toolchain: Toolchain, serial: str, transport: str = "auto") 
     try:
         client = BridgeClient(toolchain, serial, connect_timeout=0.9 if transport == "auto" else 3.0)
         health = client.health()
-        if int(health.get("protocol", 0)) != 1:
+        if int(health.get("protocol", 0)) != PROTOCOL_VERSION:
             client.close()
             raise AndroidSimError(f"Unsupported Android bridge protocol: {health.get('protocol')}")
         return BridgeController(toolchain, serial, client)
