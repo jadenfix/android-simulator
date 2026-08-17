@@ -1,5 +1,14 @@
 # Android Simulator for Apple Silicon
 
+> **Archived — development moved to [tempera-dev/tempera-android](https://github.com/tempera-dev/tempera-android).**
+>
+> The successor is a cross-platform Rust Android agent engine with a persistent
+> daemon, revision-safe native Accessibility bridge, independent ADB fallback,
+> optional Appium support, sessions, MCP, dashboard, skills, and evals. Install
+> the public alpha from the [v0.4.0-alpha.1 release](https://github.com/tempera-dev/tempera-android/releases/tag/v0.4.0-alpha.1).
+> This repository remains available as the historical source and complete import
+> lineage; it will receive no further feature development.
+
 A reproducible, command-line-managed Android environment for an M-series Mac.
 It uses the **official Android Emulator** as the virtualization engine and adds
 the code needed to install the SDK, create isolated phone-like devices, start
