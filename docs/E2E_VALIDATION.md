@@ -5,3 +5,5 @@ The `actual-emulator-e2e` workflow installs the official Android Emulator and an
 Host-side unit tests alone do not prove Android boots. The workflow must complete successfully at the exact recorded commit before the Linux emulator lane is marked ready. This test does not validate Apple Silicon Hypervisor.framework, Google Play certification, custom Wi-Fi SSIDs or physical device behavior. The original Apple Silicon path needs a separate run on supported hardware.
 
 The repository was reversibly unarchived to permit this requested validation work; its successor link remains intact. No successor repository is modified.
+
+The first actual CLI run exposed an AVD directory mismatch: avdmanager succeeded but configuration lookup failed. SDK subprocess environments now explicitly share `ANDROID_AVD_HOME`, emulator listing uses that same environment, and creation ensures the directory exists. This fixes real toolchain orchestration rather than replacing it with a mock.

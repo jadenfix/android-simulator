@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import DEFAULT_API_CANDIDATES, Toolchain, image_package
+from .config import DEFAULT_API_CANDIDATES, Toolchain, image_package, avd_home
 from .errors import AndroidSimError
 from .util import run
 
@@ -21,6 +21,8 @@ def sdk_env(toolchain: Toolchain) -> dict[str, str]:
     env = dict(os.environ)
     env["ANDROID_SDK_ROOT"] = str(toolchain.sdk_root)
     env["ANDROID_HOME"] = str(toolchain.sdk_root)
+    # Keep avdmanager and emulator on the same configured state directory.
+    env["ANDROID_AVD_HOME"] = str(avd_home())
     return env
 
 

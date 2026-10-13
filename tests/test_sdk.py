@@ -52,3 +52,14 @@ class SdkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateDirectoryTests(unittest.TestCase):
+    def test_sdk_env_pins_avd_directory(self):
+        from unittest.mock import patch
+        from android_simulator.sdk import sdk_env
+        from android_simulator.config import Toolchain
+        from pathlib import Path
+        toolchain = Toolchain(*(Path('/example') for _ in range(5)))
+        with patch('android_simulator.sdk.avd_home', return_value=Path('/tmp/isolated-avds')):
+            self.assertEqual(sdk_env(toolchain)['ANDROID_AVD_HOME'], '/tmp/isolated-avds')
