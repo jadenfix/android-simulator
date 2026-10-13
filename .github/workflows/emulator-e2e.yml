@@ -1,0 +1,55 @@
+name: actual-emulator-e2e
+on:
+  push:
+    branches: [codex/real-emulator-e2e]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-kvm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - name: Enable runner KVM
+        run: |
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+      - name: Install official emulator and real Android image
+        run: sdkmanager 'platform-tools' 'emulator' 'platforms;android-35' 'system-images;android-35;google_apis;x86_64'
+      - name: Install package and run host tests
+        run: |
+          python -m pip install --no-deps .
+          python -m unittest discover -s tests -v
+      - name: Create, boot, inspect, and stop using this repository's CLI
+        run: |
+          mkdir -p evidence
+          android-sim create --name ci-real-phone --profile google --api 35 --arch x86_64 --ram-mb 2048 --data-gb 8 > evidence/create.json
+          android-sim start ci-real-phone --cold --headless --no-audio --timeout 480 --emulator-arg=-gpu --emulator-arg=swiftshader_indirect > evidence/start.txt
+          android-sim identity --serial emulator-5554 --json > evidence/identity.json
+          android-sim network --serial emulator-5554 status > evidence/network.json
+          android-sim shell --serial emulator-5554 -- getprop sys.boot_completed | tee evidence/boot.txt
+          grep -q '^1' evidence/boot.txt
+          android-sim shell --serial emulator-5554 -- cmd package list packages android > evidence/packages.txt
+          grep -q 'package:android' evidence/packages.txt
+          adb -s emulator-5554 exec-out screencap -p > evidence/android.png
+          test -s evidence/android.png
+          android-sim stop --serial emulator-5554
+          android-sim delete ci-real-phone
+      - name: Preserve real-device evidence and emulator logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-evidence
+          path: |
+            evidence/
+            ~/.android-simulator/logs/
