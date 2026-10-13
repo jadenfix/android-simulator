@@ -26,7 +26,7 @@ from .util import atomic_write, load_json, parse_version, run, save_json
 
 
 def list_avds(toolchain: Toolchain) -> list[str]:
-    result = run([toolchain.emulator, "-list-avds"], quiet=True)
+    result = run([toolchain.emulator, "-list-avds"], env=sdk_env(toolchain), quiet=True)
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -142,6 +142,7 @@ def create_avd(
         chosen_device,
         "-f",
     ]
+    avd_home().mkdir(parents=True, exist_ok=True)
     run(command, input_text="no\n", env=sdk_env(toolchain), capture=False)
     config_path = configure_avd(
         name,
