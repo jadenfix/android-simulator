@@ -43,7 +43,13 @@ jobs:
           grep -q '^1' evidence/boot.txt
           android-sim shell --serial emulator-5554 -- cmd package list packages android > evidence/packages.txt
           grep -q 'package:android' evidence/packages.txt
+          android-sim shell --serial emulator-5554 -- input keyevent KEYCODE_WAKEUP
+          android-sim shell --serial emulator-5554 -- wm dismiss-keyguard
+          android-sim shell --serial emulator-5554 -- am start -W -a android.settings.SETTINGS > evidence/settings.txt
+          sleep 3
           adb -s emulator-5554 exec-out screencap -p > evidence/android.png
+          python -m pip install Pillow
+          python -c "from PIL import Image; im=Image.open('evidence/android.png').convert('RGB'); assert len(im.getcolors(im.width*im.height) or []) > 16, 'Android screenshot lacks visible rendered UI'"
           test -s evidence/android.png
           android-sim stop --serial emulator-5554
           android-sim delete ci-real-phone
